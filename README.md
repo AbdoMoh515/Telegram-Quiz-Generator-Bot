@@ -1,114 +1,110 @@
-# Ishraqatfajr Quiz Bot
+Telegram Quiz Master Bot
+📖 Overview
+The Telegram Quiz Master Bot is a powerful and efficient tool designed to automate two primary tasks related to Telegram quizzes:
 
-**Version: 1.2**
+Quiz Creation: It can take a formatted text file (.txt or .pdf) containing questions and answers and automatically generate anonymous Telegram quizzes from it.
 
-A Telegram bot that processes quiz questions from PDF or text files and handles forwarded Telegram quizzes.
+Quiz Extraction: It can receive multiple forwarded Telegram quizzes and consolidate them into a single, neatly formatted text file.
 
-## Features
+The bot features a secure, admin-only panel for user management and is built on a modern, asynchronous architecture using aiogram 3.x to ensure high performance and stability.
 
-- **File Processing**: Extract questions from PDF and text files and convert them to Telegram quizzes
-- **Flexible Question Recognition**: Handles various question formats with different numbering and option styles
-- **Quiz Forwarding**: Extract and collect forwarded Telegram quizzes and convert them to text format
-- **Keyboard Controls**: Easy-to-use keyboard buttons for all operations
-- **Error Handling**: Robust error handling with detailed logs
+✨ Features
+Create Quizzes from File: Supports both .pdf and .txt file uploads.
 
-## Documentation
+Extract from Forwards: Intelligently collects forwarded quizzes and exports them to a single text file.
 
-For a detailed explanation of the project structure, key components, and functions, please see the [Code Documentation](CODE_DOCUMENTATION.md).
+Robust Question Parsing: Reliably extracts questions, options, and answers from structured text.
 
-## Setup Instructions
+Secure Admin Panel: Access is restricted to designated admin User IDs.
 
-### Prerequisites
+Interactive User Management: Admins can allow or remove users through a user-friendly, button-based interface, eliminating the need for manual commands.
 
-- Python 3.8 or higher
-- Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
+Access Control: Only admins and specifically allowed users can interact with the bot's features.
 
-### Installation
+AI Prompt Helper: Provides users with a ready-to-use prompt to format their questions correctly using an AI assistant.
 
-1. Clone the repository:
-   ```
-   git clone https://github.com/yourusername/Ishraqatfajr-Quiz-Bot.git
-   cd Ishraqatfajr-Quiz-Bot
-   ```
+High Performance:
 
-2. Create a virtual environment (optional but recommended):
-   ```
-   python -m venv env
-   source env/bin/activate  # On Windows: env\Scripts\activate
-   ```
+Uses an efficient "batch collector" for forwarded quizzes to handle large volumes without crashing.
 
-3. Install the required packages:
-   ```
-   pip install -r requirements.txt
-   ```
+Processes file I/O in a non-blocking way to keep the bot responsive at all times.
 
-4. Create a `.env` file in the project root directory with the following content:
-   ```
-   # Telegram Bot Configuration
-   TELEGRAM_TOKEN=your_telegram_bot_token
-   LOG_CHANNEL_ID=your_log_channel_id
-   
-   # Bot Settings
-   MIN_INTERVAL_BETWEEN_FILES=60
-   ```
+Stable & Modern: Built with aiogram 3.x and its Finite State Machine (FSM) for robust state management.
 
-### Running the Bot
+📂 Project Structure
+The project is organized into several focused modules:
 
-```
+main.py: The main entry point for the bot. Initializes the dispatcher and registers all handlers.
+
+handlers.py: Contains the core logic for user-facing features (start, help, file processing, quiz collection).
+
+handlers_admin.py: Contains all logic for the admin panel, including the access control middleware and interactive user management.
+
+keyboards.py: Defines all the reply and inline keyboards used for the bot's interface.
+
+utils.py: A collection of helper functions for tasks like text extraction, question parsing, and file saving.
+
+states.py: Defines the formal states for the Finite State Machine (FSM).
+
+filedb.py: A simple, thread-safe, file-based database system using JSON files to store user data.
+
+config.py: Manages loading configuration and settings from the .env file.
+
+requirements.txt: Lists all the necessary Python packages for the project.
+
+.env: The local configuration file where you store your secrets (not included in version control).
+
+🚀 Setup and Installation
+Follow these steps to get your bot running locally.
+
+1. Prerequisites
+Python 3.10 or newer.
+
+2. Installation Steps
+Clone the Repository (or Download Files)
+
+Download all the project files into a single directory.
+
+Create and Activate a Virtual Environment
+
+This is a crucial step to keep your project dependencies isolated.
+
+Open a terminal in your project directory and run:
+
+# Create the virtual environment
+python -m venv venv
+
+# Activate it (on Windows)
+.\venv\Scripts\Activate
+
+# Activate it (on macOS/Linux)
+source venv/bin/activate
+
+Install Dependencies
+
+Install all the required packages using the requirements.txt file:
+
+pip install -r requirements.txt
+
+Configure Environment Variables
+
+Create a file named .env in the root of your project directory.
+
+Copy the content from the example below and fill in your details.
+
+.env file content:
+
+# Get this token from Telegram's @BotFather
+TELEGRAM_TOKEN="YOUR_TELEGRAM_BOT_TOKEN_HERE"
+
+# A list of admin Telegram User IDs, separated by commas (no spaces)
+# Get your ID from @userinfobot
+ADMIN_IDS="123456789,987654321"
+
+# (Optional) The ID of a channel where the bot can log errors
+LOG_CHANNEL_ID="-1001234567890"
+
+▶️ How to Run
+With your virtual environment activated and your .env file configured, start the bot with this simple command:
+
 python main.py
-```
-
-## Usage
-
-### Creating Quizzes from Files
-
-1. Click "📝 Create Quiz" button
-2. Send a PDF or text file with questions in the format:
-   ```
-   1. Question text
-   a) Option A
-   b) Option B
-   c) Option C
-   d) Option D
-   Answer: b
-   ```
-3. The bot will extract and send questions as Telegram quizzes
-4. Use the "Show Extracted Questions" button to see all extracted questions in text format
-
-### Extracting Forwarded Quizzes
-
-1. Click "📥 Extract Quizzes from Forwards" button
-2. Forward Telegram quizzes to the bot
-3. Click "Finish Extraction" when done
-4. The bot will send all questions in a single formatted text message with correct answers marked
-
-## Question Format
-
-The bot supports various question formats:
-
-- Questions with or without numbers
-- Options labeled with letters (a-z) followed by ")" or "."
-- Answer line starting with "Answer:" or "*Answer:"
-- Any number of options (minimum 2)
-
-## Version History
-
-- **v1.2** (Current): Added GitHub readiness, improved answer extraction, and fixed various bugs
-- **v1.1**: Added flexible question recognition and keyboard controls
-- **v1.0**: Initial release with basic PDF processing and quiz generation
-
-## License
-
-This bot is licensed under the **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)** License.
-
-- You can use, modify, and share it **for free** as long as you give credit and do not use it commercially.
-- **Commercial use is not allowed** without written permission.
-- If you make changes and share them, you must keep the same license.
-
-Read the full license terms in the [LICENSE](LICENSE) file.
-
-
-## Acknowledgements
-
-- [aiogram](https://github.com/aiogram/aiogram) - Telegram Bot framework
-- [PyMuPDF](https://github.com/pymupdf/PyMuPDF) - PDF processing library

@@ -1,101 +1,131 @@
+# filedb.py
+
 import json
 import os
 import logging
+import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Set
 
 USERS_FILE = 'users.json'
 ALLOWED_USERS_FILE = 'allowed_users.json'
 
+# --- Thread-safe Lock ---
+# This lock prevents race conditions where two users writing to the file at the same time could corrupt it.
+_file_lock = threading.Lock()
+
 # In-memory cache for allowed user IDs for performance
 _allowed_user_ids_cache: Set[int] = set()
 
-# --- Cache Management ---
 
 def load_allowed_users_cache():
     """Loads allowed user IDs from the file into the in-memory cache."""
     global _allowed_user_ids_cache
     logging.info("Loading allowed users into cache...")
-    allowed_users = load_json(ALLOWED_USERS_FILE)
+    with _file_lock: # Ensure we don't read while another thread is writing
+        allowed_users = _load_json_internal(ALLOWED_USERS_FILE)
     _allowed_user_ids_cache = {user['id'] for user in allowed_users}
     logging.info(f"Loaded {len(_allowed_user_ids_cache)} allowed users into cache.")
 
-# --- Utility Functions ---
 
-def load_json(filename: str) -> List[Dict]:
+# --- Internal (unsafe) I/O functions ---
+
+def _load_json_internal(filename: str) -> List[Dict]:
+    """Internal function to load JSON without a lock. Assumes lock is held by caller."""
     if not os.path.exists(filename):
         return []
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
+        logging.error(f"Could not read or parse {filename}, returning empty list.")
         return []
 
-def save_json(filename: str, data: List[Dict]):
+def _save_json_internal(filename: str, data: List[Dict]):
+    """Internal function to save JSON without a lock. Assumes lock is held by caller."""
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# --- General User Management ---
+
+# --- Public Thread-safe Functions ---
 
 def upsert_user(user_id: int, username: str, first_name: str) -> bool:
-    users = load_json(USERS_FILE)
-    if any(u['id'] == user_id for u in users):
-        return True  # Already exists
-    
-    user_entry = {
-        'id': user_id,
-        'username': username or '',
-        'first_name': first_name or '',
-        'date_joined': datetime.now().isoformat()
-    }
-    users.append(user_entry)
-    save_json(USERS_FILE, users)
+    """Adds a user to the main user list if they don't exist. Thread-safe."""
+    with _file_lock:
+        users = _load_json_internal(USERS_FILE)
+        if any(u['id'] == user_id for u in users):
+            return True  # Already exists
+
+        user_entry = {
+            'id': user_id,
+            'username': username or '',
+            'first_name': first_name or '',
+            'date_joined': datetime.now().isoformat()
+        }
+        users.append(user_entry)
+        _save_json_internal(USERS_FILE, users)
     return True
 
 def get_user_by_id(user_id: int) -> Optional[Dict]:
-    users = load_json(USERS_FILE)
+    """Gets a user by their ID from the main list. Thread-safe."""
+    with _file_lock:
+        users = _load_json_internal(USERS_FILE)
     return next((user for user in users if user['id'] == user_id), None)
 
 def list_all_users() -> List[Dict]:
-    return load_json(USERS_FILE)
-
-# --- Allowed Users Management (with Caching) ---
+    """Lists all users from the main list. Thread-safe."""
+    with _file_lock:
+        return _load_json_internal(USERS_FILE)
 
 def add_allowed_user_from_user(user: Dict) -> bool:
-    """Adds a user to the allowed list and updates the cache."""
+    """Adds a user to the allowed list and updates the cache. Thread-safe."""
     user_id = user['id']
     if user_id in _allowed_user_ids_cache:
-        return True  # Already allowed
+        return True
 
-    allowed_list = load_json(ALLOWED_USERS_FILE)
-    allowed_list.append(user)
-    save_json(ALLOWED_USERS_FILE, allowed_list)
+    with _file_lock:
+        allowed_list = _load_json_internal(ALLOWED_USERS_FILE)
+        if any(u['id'] == user_id for u in allowed_list):
+             # Cache was out of sync, update it and return
+            _allowed_user_ids_cache.add(user_id)
+            return True
+
+        allowed_list.append(user)
+        _save_json_internal(ALLOWED_USERS_FILE, allowed_list)
     
-    # Update cache
-    _allowed_user_ids_cache.add(user_id)
+    _allowed_user_ids_cache.add(user_id) # Update cache after successful write
     return True
 
 def list_allowed_users() -> List[Dict]:
-    return load_json(ALLOWED_USERS_FILE)
+    """Lists all allowed users. Thread-safe."""
+    with _file_lock:
+        return _load_json_internal(ALLOWED_USERS_FILE)
 
 def remove_allowed_user(user_id: int) -> bool:
-    """Removes a user from the allowed list and updates the cache."""
+    """Removes a user from the allowed list and updates the cache. Thread-safe."""
     if user_id not in _allowed_user_ids_cache:
-        return False # Not found in cache, so not in file either
+        return False # Not in cache, so not in file either. Fast path.
 
-    allowed_list = load_json(ALLOWED_USERS_FILE)
-    initial_count = len(allowed_list)
-    new_allowed = [u for u in allowed_list if u['id'] != user_id]
+    with _file_lock:
+        allowed_list = _load_json_internal(ALLOWED_USERS_FILE)
+        initial_count = len(allowed_list)
+        new_allowed = [u for u in allowed_list if u['id'] != user_id]
 
-    if len(new_allowed) == initial_count:
-        return False # Should not happen if cache is consistent
+        if len(new_allowed) == initial_count:
+            # This can happen if cache is stale. Remove from cache and report failure.
+            if user_id in _allowed_user_ids_cache:
+                _allowed_user_ids_cache.remove(user_id)
+            return False
 
-    save_json(ALLOWED_USERS_FILE, new_allowed)
-    
-    # Update cache
-    _allowed_user_ids_cache.remove(user_id)
+        _save_json_internal(ALLOWED_USERS_FILE, new_allowed)
+
+    # Update cache after successful write
+    if user_id in _allowed_user_ids_cache:
+        _allowed_user_ids_cache.remove(user_id)
     return True
 
+
 def is_user_allowed(user_id: int) -> bool:
-    """Checks if a user is allowed using the in-memory cache."""
+    """Checks if a user is allowed using the fast in-memory cache."""
+    # This function is read-only on the cache, so it doesn't need a lock.
     return user_id in _allowed_user_ids_cache

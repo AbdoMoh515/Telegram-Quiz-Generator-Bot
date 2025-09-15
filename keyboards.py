@@ -1,34 +1,45 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from typing import List, Dict
 from config import ADMIN_IDS
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    """Create the main keyboard, adding admin buttons if applicable."""
+    """Create the main keyboard, adding admin and utility buttons."""
     keyboard_buttons = [
         [KeyboardButton(text="📝 Create Quiz")],
         [KeyboardButton(text="📥 Extract Quizzes from Forwards")],
-        [KeyboardButton(text="❓ Help")]
+        [KeyboardButton(text="❓ Help"), KeyboardButton(text="🤖 Get AI Prompt")]
     ]
 
-    # Add admin button if the user is an admin
     if user_id in ADMIN_IDS:
         keyboard_buttons.append([KeyboardButton(text="👑 Admin Panel")])
 
-    keyboard = ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=keyboard_buttons,
         resize_keyboard=True,
         one_time_keyboard=False
     )
-    return keyboard
 
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
     """Create the admin panel keyboard."""
-    keyboard = ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📋 List Allowed Users"), KeyboardButton(text="👥 List All Users")],
             [KeyboardButton(text="✅ Allow User"), KeyboardButton(text="❌ Remove User")],
+            [KeyboardButton(text="📋 List Allowed Users"), KeyboardButton(text="👥 List All Users")],
             [KeyboardButton(text="⬅️ Back to Main Menu")]
         ],
         resize_keyboard=True,
         one_time_keyboard=False
     )
-    return keyboard
+
+def create_user_selection_keyboard(users: List[Dict], action_prefix: str) -> InlineKeyboardMarkup:
+    """Dynamically creates a keyboard for selecting a user."""
+    buttons = []
+    for user in users:
+        user_name = user.get('first_name') or user.get('username') or f"ID: {user['id']}"
+        callback_data = f"{action_prefix}:{user['id']}"
+        buttons.append([InlineKeyboardButton(text=user_name, callback_data=callback_data)])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
