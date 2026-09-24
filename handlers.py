@@ -44,14 +44,27 @@ STRICT FORMAT 1 - MULTIPLE CHOICE (questions that have options):
 1. Each question starts on a new line with a number followed by a period (e.g. 1.).
 2. Each option is on its own new line, starting with a lowercase letter followed by a parenthesis (e.g. a), b), c)).
 3. After all options, a separate line begins exactly with Answer: followed by a space and the correct lowercase letter only (e.g. Answer: c).
+4. Optionally, a separate line AFTER the Answer line may carry a user-supplied clarification, written with the canonical label (e.g. Clarification: Because ...). Only include it when the user actually provided one.
 
 STRICT FORMAT 2 - WRITTEN (questions with NO options):
 1. Each question starts on a new line with a number followed by a period (e.g. 2.).
 2. There are NO option lines at all.
 3. The next line begins exactly with Answer: followed by a space and the full correct answer text (e.g. Answer: George Orwell).
+4. Optionally, a separate line AFTER the Answer line may carry a user-supplied clarification, written with the canonical label (e.g. Clarification: Because ...). Only include it when the user actually provided one.
+
+OPTIONAL CLARIFICATION:
+1. A clarification is strictly optional and must NEVER be invented or generated: only carry through a clarification the user actually provided, whether it was labeled (Clarification: ... with the English label case-insensitive and the colon optional, or التوضيح: ...) or unlabeled free text after the Answer line.
+2. When the user provided one, place it on its own separate line after the Answer line using the canonical label Clarification: followed by the user's text. When the user provided none, output nothing after the Answer line.
+3. Example with a user-supplied clarification:
+1. What is the capital of Egypt?
+a) Giza
+b) Alexandria
+c) Cairo
+Answer: c
+Clarification: Cairo has been the capital since the Fatimid era.
 
 CRITICAL RULES:
-1. Every question must be numbered and must end with its own Answer: line.
+1. Every question must be numbered and must include its own Answer: line (an optional clarification line may follow it).
 2. Never write a single-letter answer without options, and never write full-text answers for questions that have options.
 3. There must be exactly one blank line between each complete question block.
 4. Output ONLY one fenced code block containing the formatted questions. No introductory or concluding remarks, no second code block, no prose outside the code block.
@@ -85,6 +98,10 @@ CREATE_QUIZ_TEXT = (
     "<pre>1. Question?\na) Option 1\nb) Option 2\nAnswer: b</pre>\n"
     "Written (no options):\n"
     "<pre>1. Question?\nAnswer: Full answer text</pre>\n"
+    "Optional clarification after the Answer line (only when you have one):\n"
+    "<pre>Clarification: extra context</pre>\n"
+    "(also accepts <code>التوضيح:</code> or unlabeled text on the line(s) "
+    "after Answer; never invented by the bot).\n"
     "You will see a preview to confirm before anything is sent."
 )
 
@@ -93,7 +110,9 @@ COLLECT_INTRO_TEXT = (
     "(one or several per message is fine).\n\n"
     "Use the same strict format: numbered questions, options as "
     "<code>a)</code> lines for MCQ or no options for written, each ending "
-    "with an <code>Answer:</code> line.\n\n"
+    "with an <code>Answer:</code> line. You may add an optional "
+    "<code>Clarification:</code> line (or <code>التوضيح:</code> / unlabeled "
+    "text) after Answer only when you have extra context.\n\n"
     f"Limits: up to {MAX_COLLECT_MESSAGES} messages / "
     f"{MAX_COLLECT_CHARS} characters. Press ✅ Finish when done."
 )
@@ -135,6 +154,9 @@ async def help_command(message: types.Message):
         "Written (no options):\n"
         "<pre>2. Who wrote the novel 1984?\n"
         "Answer: George Orwell</pre>\n"
+        "Optional clarification (only when you have one): add a separate line "
+        "after Answer, e.g. <code>Clarification: extra context</code> "
+        "(also accepts <code>التوضيح:</code> or unlabeled text).\n"
         "You will get a preview with Send/Cancel before anything is sent.\n\n"
         "<b>2. Collect Mode:</b>\n"
         "Press '🧩 Collect Messages' to send questions over several messages, "

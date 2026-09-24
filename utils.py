@@ -35,6 +35,10 @@ MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 #: Telegram quiz-poll limits.
 MAX_POLL_QUESTION_LENGTH = 255
 MAX_POLL_OPTION_LENGTH = 100
+#: Telegram quiz-poll explanation (user-supplied clarification) limit.
+#: Explanations longer than this are rejected at parse/validation time so
+#: Telegram never silently truncates them.
+MAX_POLL_EXPLANATION_LENGTH = 200
 
 #: Safety caps for pasted/collected input.
 MAX_INPUT_CHARS = 200_000
@@ -59,6 +63,8 @@ PREVIEW_MAX_SKIPPED_SHOWN = 10
 #       "options": [...],           # MCQ options ([] for written)
 #       "correct_option_id": int,   # MCQ only (None for written)
 #       "answer_text": str,         # written answer ("" for MCQ)
+#       "clarification": str,       # optional user-supplied clarification
+#                                   # ("" when absent; never fabricated)
 #   }
 
 MCQ = "mcq"
@@ -66,7 +72,7 @@ WRITTEN = "written"
 
 
 def make_mcq(question_num: str, question: str, options: List[str],
-             correct_option_id: int) -> Dict[str, Any]:
+             correct_option_id: int, clarification: str = "") -> Dict[str, Any]:
     return {
         "type": MCQ,
         "question_num": str(question_num),
@@ -74,11 +80,12 @@ def make_mcq(question_num: str, question: str, options: List[str],
         "options": list(options),
         "correct_option_id": correct_option_id,
         "answer_text": "",
+        "clarification": str(clarification or ""),
     }
 
 
 def make_written(question_num: str, question: str,
-                 answer_text: str) -> Dict[str, Any]:
+                 answer_text: str, clarification: str = "") -> Dict[str, Any]:
     return {
         "type": WRITTEN,
         "question_num": str(question_num),
@@ -86,6 +93,7 @@ def make_written(question_num: str, question: str,
         "options": [],
         "correct_option_id": None,
         "answer_text": answer_text,
+        "clarification": str(clarification or ""),
     }
 
 
@@ -147,16 +155,30 @@ def validate_question(
                     f"({len(str(o))} chars, max {MAX_POLL_OPTION_LENGTH}): "
                     f"{str(o)[:50]!r}."
                 )
+        clar = str(q.get("clarification") or "").strip()
+        if clar and len(clar) > MAX_POLL_EXPLANATION_LENGTH:
+            return (
+                f"MCQ clarification too long for a Telegram quiz poll "
+                f"explanation ({len(clar)} chars, "
+                f"max {MAX_POLL_EXPLANATION_LENGTH})."
+            )
     else:
         if not str(q.get("answer_text", "")).strip():
             return "Written question has an empty answer."
         if q.get("options"):
             return "Written question must not carry options."
-        rendered_len = len(
+        rendered = (
             f"<b>{disp}. "
             f"{html.escape(str(q.get('question', '')))}</b>\n\nAnswer: "
             f"<tg-spoiler>{html.escape(str(q.get('answer_text', '')))}</tg-spoiler>"
         )
+        clar = str(q.get("clarification") or "").strip()
+        if clar:
+            rendered += (
+                f"\nClarification: "
+                f"<tg-spoiler>{html.escape(clar)}</tg-spoiler>"
+            )
+        rendered_len = len(rendered)
         if rendered_len > MAX_TELEGRAM_MESSAGE_LENGTH:
             return (
                 f"Written question too long for a Telegram message "
@@ -195,7 +217,8 @@ async def extract_text_from_file(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 #
 # Strict, backward-compatible input. Every question block must start with a
-# number (``1.`` / ``1)``) and end with an ``Answer:`` line:
+# number (``1.`` / ``1)``) and requires an ``Answer:`` line (an optional
+# clarification line may follow it):
 #
 #   Multiple choice (>= 2 options, single-letter answer):
 #       1. What is ...?
@@ -207,6 +230,13 @@ async def extract_text_from_file(file_path: str) -> str:
 #       2. Who wrote ...?
 #       Answer: George Orwell
 #
+#   Optional user-supplied clarification AFTER the Answer line, either
+#   labeled (``Clarification: ...`` / ``التوضيح: ...``, English label
+#   case-insensitive, colon optional) or unlabeled free text. The Answer
+#   itself stays exactly the single Answer line; clarification is stored
+#   under ``clarification`` ("" when absent, never fabricated) and
+#   round-trips via the canonical ``Clarification: ...`` label.
+#
 # Anti-confusion rules:
 #   * A block WITH options is always an MCQ candidate. A non-letter answer
 #     (e.g. ``Answer: Paris``) is skipped, never silently treated as written.
@@ -217,13 +247,56 @@ async def extract_text_from_file(file_path: str) -> str:
 
 _BLOCK_SPLIT_RE = re.compile(r"\n(?=\s*(?:Q\s*)?\d+\s*[.\-)])")
 _HEADER_RE = re.compile(r"^\s*(?:Q\s*)?(\d+)\s*[.\-)]\s*(.*)$", re.DOTALL)
-_ANSWER_RE = re.compile(r"^[ \t]*Answer\s*:\s*(.*?)\s*$", re.MULTILINE | re.DOTALL)
+_ANSWER_RE = re.compile(r"^[ \t]*Answer[ \t]*:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 _OPTION_LINE_RE = re.compile(r"^[ \t]*([A-Za-z])[.)]\s+(.*?)\s*$", re.MULTILINE)
 _SINGLE_LETTER_RE = re.compile(r"^([A-Za-z])\s*[)]?\s*$")
+# Optional user-supplied clarification label on the line(s) after Answer.
+# English label is case-insensitive, Arabic as given; colon is optional.
+_CLARIFICATION_LABEL_RE = re.compile(
+    r"^[ \t]*(clarification|التوضيح)[ \t]*:?[ \t]*(.*)$",
+    re.IGNORECASE,
+)
 
 
 def _collapse(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_clarification(post_answer_text: str) -> str:
+    """Extract optional user clarification from text after the Answer line.
+
+    Accepts a labeled first line (``Clarification: ...`` /
+    ``التوضيح: ...``, English case-insensitive, optional colon) or
+    unlabeled free text. Returns "" when absent; never fabricates content.
+    Multi-line content is preserved with newlines (each line collapsed).
+    """
+    s = (post_answer_text or "").strip()
+    if not s:
+        return ""
+    lines = s.split("\n")
+    label_match = _CLARIFICATION_LABEL_RE.match(lines[0])
+    if label_match:
+        first = _collapse(label_match.group(2))
+        rest = [_collapse(ln) for ln in lines[1:]]
+        # Drop leading/trailing blank continuation lines, keep inner ones.
+        while rest and not rest[0]:
+            rest.pop(0)
+        while rest and not rest[-1]:
+            rest.pop()
+        parts = ([first] if first else []) + rest
+        # If label line was empty and no continuation, there is no content.
+        if not any(p for p in parts):
+            return ""
+        return "\n".join(parts).strip()
+    # Unlabeled free text: collapse each line, trim blank edges.
+    collapsed = [_collapse(ln) for ln in lines]
+    while collapsed and not collapsed[0]:
+        collapsed.pop(0)
+    while collapsed and not collapsed[-1]:
+        collapsed.pop()
+    if not any(collapsed):
+        return ""
+    return "\n".join(collapsed).strip()
 
 
 def extract_questions_from_text(
@@ -272,6 +345,15 @@ def extract_questions_from_text(
             if not answer_raw:
                 skipped.append({"number": question_num, "reason": "Empty answer text."})
                 continue
+
+            # Optional user-supplied clarification: line(s) AFTER the Answer
+            # line in the same block. Labeled ("Clarification:"/"التوضيح:",
+            # English case-insensitive, optional colon) or unlabeled free
+            # text. The Answer itself stays exactly the single Answer line;
+            # clarification is never mistaken for an option (only pre-answer
+            # lines are scanned for options) nor for a next question (blocks
+            # are split on numbering). Absent -> "" (never fabricated).
+            clarification = _parse_clarification(block[answer_match.end():])
 
             # Option lines are only recognised BEFORE the Answer line, so a
             # written answer can never be mistaken for an option.
@@ -355,6 +437,7 @@ def extract_questions_from_text(
                 candidate = make_mcq(
                     question_num, question_text, options,
                     letters.index(correct_letter),
+                    clarification,
                 )
                 too_long = validate_question(candidate)
                 if too_long is not None:
@@ -401,7 +484,8 @@ def extract_questions_from_text(
                         "reason": "Duplicate question.",
                     })
                     continue
-                candidate = make_written(question_num, question_text, answer_raw)
+                candidate = make_written(question_num, question_text, answer_raw,
+                                         clarification)
                 too_long = validate_question(candidate)
                 if too_long is not None:
                     skipped.append({
@@ -456,11 +540,18 @@ def format_mcq_export(q: Dict[str, Any], number: int) -> str:
     for j, opt in enumerate(q["options"]):
         lines.append(f"{chr(97 + j)}) {opt}")
     lines.append(f"Answer: {chr(97 + q['correct_option_id'])}")
+    clar = str(q.get("clarification") or "").strip()
+    if clar:
+        lines.append(f"Clarification: {clar}")
     return "\n".join(lines)
 
 
 def format_written_export(q: Dict[str, Any], number: int) -> str:
-    return f"{number}. {q['question']}\nAnswer: {q['answer_text']}"
+    lines = [f"{number}. {q['question']}", f"Answer: {q['answer_text']}"]
+    clar = str(q.get("clarification") or "").strip()
+    if clar:
+        lines.append(f"Clarification: {clar}")
+    return "\n".join(lines)
 
 
 def format_question_export(q: Dict[str, Any], number: int) -> str:
@@ -516,11 +607,17 @@ def format_written_send_text(q: Dict[str, Any], number: int) -> str:
     returned verbatim: if it exceeds Telegram's 4096-char cap a ValueError
     is raised instead of truncating the rendered HTML (truncating could drop
     the closing </tg-spoiler> or silently change the answer). Oversized
-    items are therefore skipped with a reason at parse time.
+    items are therefore skipped with a reason at parse time. An optional
+    user-supplied clarification is shown on a new line under the answer in
+    its own spoiler (answer stays spoiled too); the length check accounts
+    for it.
     """
     question = html.escape(str(q["question"]))
     answer = html.escape(str(q["answer_text"]))
     text = f"<b>{number}. {question}</b>\n\nAnswer: <tg-spoiler>{answer}</tg-spoiler>"
+    clar = str(q.get("clarification") or "").strip()
+    if clar:
+        text += f"\nClarification: <tg-spoiler>{html.escape(clar)}</tg-spoiler>"
     if len(text) > MAX_TELEGRAM_MESSAGE_LENGTH:
         raise ValueError(
             f"Written question too long for a Telegram message "
@@ -638,14 +735,20 @@ async def send_telegram_quizzes(
                     parse_mode="HTML",
                 )
             else:
-                await bot.send_poll(
-                    chat_id=chat_id,
-                    question=format_mcq_poll_question(q, current_question_num),
-                    options=format_mcq_poll_options(q),
-                    type="quiz",
-                    correct_option_id=q["correct_option_id"],
-                    is_anonymous=True,
-                )
+                poll_kwargs: Dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "question": format_mcq_poll_question(q, current_question_num),
+                    "options": format_mcq_poll_options(q),
+                    "type": "quiz",
+                    "correct_option_id": q["correct_option_id"],
+                    "is_anonymous": True,
+                }
+                # Optional user-supplied clarification -> quiz explanation.
+                # Plain text, sent only when present (never fabricated).
+                clar = str(q.get("clarification") or "").strip()
+                if clar:
+                    poll_kwargs["explanation"] = clar
+                await bot.send_poll(**poll_kwargs)
             sent_count += 1
             current_question_num += 1
             await asyncio.sleep(0.5)
@@ -662,6 +765,9 @@ async def format_quiz_as_text(quiz: Poll, question_num: Optional[int] = None) ->
 
     This is the forwarded-poll export path (MCQ polls only) and is kept
     unchanged: a missing correct answer still yields "Answer: Not provided".
+    When the source poll carries a non-empty ``explanation``, it is appended
+    as a canonical ``Clarification: ...`` line; nothing is invented when the
+    source has no explanation.
     """
     try:
         prefix = f"{question_num}. " if question_num is not None else ""
@@ -680,6 +786,10 @@ async def format_quiz_as_text(quiz: Poll, question_num: Optional[int] = None) ->
             text += f"Answer: {correct_letter}) {correct_text}"
         else:
             text += "Answer: Not provided"
+
+        explanation = str(getattr(quiz, "explanation", None) or "").strip()
+        if explanation:
+            text += f"\nClarification: {explanation}"
 
         return text
 

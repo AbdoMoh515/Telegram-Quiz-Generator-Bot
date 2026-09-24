@@ -9,11 +9,13 @@ from utils import (
     format_mcq_poll_options,
     format_mcq_poll_question,
     format_question_export,
+    format_quiz_as_text,
     format_written_send_text,
     is_allowed_document,
     send_telegram_quizzes,
     validate_question,
     MAX_TELEGRAM_MESSAGE_LENGTH,
+    MAX_POLL_EXPLANATION_LENGTH,
     MAX_POLL_QUESTION_LENGTH,
     MAX_POLL_OPTION_LENGTH,
 )
@@ -118,6 +120,36 @@ def test_empty_answer_skipped():
     questions, skipped = extract_questions_from_text(text)
     assert questions == []
     assert "Empty answer" in skipped[0]["reason"]
+
+
+def test_empty_answer_followed_by_labeled_clarification_skipped():
+    text = "1. What?\nAnswer:\nClarification: extra context"
+    questions, skipped = extract_questions_from_text(text)
+    assert questions == []
+    assert "Empty answer" in skipped[0]["reason"]
+
+
+def test_empty_answer_followed_by_unlabeled_clarification_skipped():
+    text = "1. What?\nAnswer:\nextra context"
+    questions, skipped = extract_questions_from_text(text)
+    assert questions == []
+    assert "Empty answer" in skipped[0]["reason"]
+
+
+def test_empty_mcq_answer_followed_by_clarification_skipped():
+    text = ("1. Pick one?\na) Yes\nb) No\nAnswer:\n"
+            "Clarification: extra context")
+    questions, skipped = extract_questions_from_text(text)
+    assert questions == []
+    assert "Empty answer" in skipped[0]["reason"]
+
+
+def test_valid_answer_does_not_consume_following_clarification():
+    questions, skipped = extract_questions_from_text(
+        "1. What?\nAnswer: Paris\nClarification: extra context")
+    assert skipped == []
+    assert questions[0]["answer_text"] == "Paris"
+    assert questions[0]["clarification"] == "extra context"
 
 
 def test_duplicate_question_skipped():
@@ -361,3 +393,197 @@ def test_empty_result_with_giant_mixed_reason_stays_valid_html():
     assert not _re.search(r"&[A-Za-z0-9#]*$", text)
     _html.unescape(text)
     assert "<" * 10 not in text
+
+
+# ---------------------------------------------------------------------------
+# Optional user-supplied clarification (MCQ + written)
+# ---------------------------------------------------------------------------
+
+def test_mcq_clarification_english_label():
+    text = MCQ_TEXT + "\nClarification: Cairo has been the capital for ages."
+    questions, skipped = extract_questions_from_text(text)
+    assert skipped == []
+    assert questions[0]["clarification"] == "Cairo has been the capital for ages."
+    # Answer line stays exactly the single letter.
+    assert questions[0]["correct_option_id"] == 2
+
+
+def test_mcq_clarification_label_case_insensitive_and_colon_optional():
+    for label in ["Clarification: foo", "clarification: foo", "CLARIFICATION: foo",
+                  "Clarification foo", "clarification   foo", "Clarification :  foo"]:
+        questions, skipped = extract_questions_from_text(MCQ_TEXT + f"\n{label}")
+        assert skipped == [], label
+        assert questions[0]["clarification"] == "foo", label
+
+
+def test_mcq_clarification_arabic_label():
+    for label in ["التوضيح: شرح مختصر", "التوضيح شرح مختصر", "التوضيح :  شرح مختصر"]:
+        questions, skipped = extract_questions_from_text(MCQ_TEXT + f"\n{label}")
+        assert skipped == [], label
+        assert questions[0]["clarification"] == "شرح مختصر", label
+
+
+def test_mcq_clarification_unlabeled():
+    questions, skipped = extract_questions_from_text(
+        MCQ_TEXT + "\nCairo has been the capital for ages."
+    )
+    assert skipped == []
+    assert questions[0]["clarification"] == "Cairo has been the capital for ages."
+
+
+def test_written_clarification_label_variants_and_unlabeled():
+    questions, _ = extract_questions_from_text(
+        WRITTEN_TEXT + "\nClarification: His most famous novel."
+    )
+    assert questions[0]["answer_text"] == "George Orwell"
+    assert questions[0]["clarification"] == "His most famous novel."
+    questions, _ = extract_questions_from_text(
+        WRITTEN_TEXT + "\nالتوضيح: أشهر رواياته."
+    )
+    assert questions[0]["clarification"] == "أشهر رواياته."
+    questions, _ = extract_questions_from_text(
+        WRITTEN_TEXT + "\nJust extra context, no label."
+    )
+    assert questions[0]["clarification"] == "Just extra context, no label."
+
+
+def test_clarification_multiline_preserved():
+    text = MCQ_TEXT + "\nClarification: first line\nsecond line"
+    questions, _ = extract_questions_from_text(text)
+    assert questions[0]["clarification"] == "first line\nsecond line"
+    text_w = WRITTEN_TEXT + "\nfirst line\nsecond line"
+    questions_w, _ = extract_questions_from_text(text_w)
+    assert questions_w[0]["clarification"] == "first line\nsecond line"
+    assert questions_w[0]["answer_text"] == "George Orwell"
+
+
+def test_clarification_not_mistaken_for_option():
+    # A clarification line that looks like an option must not create options
+    # for a written question nor break an MCQ.
+    questions, skipped = extract_questions_from_text(
+        "1. Explain?\nAnswer: yes\na) looks like option but is context"
+    )
+    assert skipped == []
+    assert questions[0]["type"] == "written"
+    assert questions[0]["answer_text"] == "yes"
+    assert questions[0]["clarification"] == "a) looks like option but is context"
+
+
+def test_absent_clarification_is_empty_and_not_exported():
+    questions, _ = extract_questions_from_text(MCQ_TEXT)
+    assert questions[0].get("clarification", "") in ("", None)
+    assert "Clarification" not in format_question_export(questions[0], 1)
+    questions_w, _ = extract_questions_from_text(WRITTEN_TEXT)
+    assert questions_w[0].get("clarification", "") in ("", None)
+    assert "Clarification" not in format_question_export(questions_w[0], 1)
+
+
+def test_export_roundtrip_with_clarification():
+    src_mcq = MCQ_TEXT + "\nClarification: Because it is."
+    questions, _ = extract_questions_from_text(src_mcq)
+    exported = format_question_export(questions[0], 1)
+    assert exported == src_mcq
+    again, skipped = extract_questions_from_text(exported)
+    assert skipped == []
+    assert again[0]["clarification"] == "Because it is."
+    assert again[0]["correct_option_id"] == 2
+    src_w = WRITTEN_TEXT + "\nClarification: His most famous novel."
+    qw, _ = extract_questions_from_text(src_w)
+    assert format_question_export(qw[0], 1) == src_w
+
+
+def test_mcq_clarification_sent_as_poll_explanation_only_when_present():
+    questions, _ = extract_questions_from_text(
+        MCQ_TEXT + "\nClarification: plain context"
+    )
+    bot = FakeBot()
+    asyncio.run(send_telegram_quizzes(bot, questions, chat_id=7, start_number=1))
+    assert bot.polls[0]["explanation"] == "plain context"
+    # Absence must not send the field at all.
+    plain, _ = extract_questions_from_text(MCQ_TEXT)
+    bot2 = FakeBot()
+    asyncio.run(send_telegram_quizzes(bot2, plain, chat_id=7, start_number=1))
+    assert "explanation" not in bot2.polls[0]
+
+
+def test_written_clarification_spoiler_and_escaping():
+    questions, _ = extract_questions_from_text(
+        "1. Evil <b>Q</b>?\nAnswer: <i>yes</i>\nClarification: <b>why</b> & more"
+    )
+    text = format_written_send_text(questions[0], 1)
+    # Answer stays in its own spoiler, clarification in a second spoiler below.
+    assert text.count("<tg-spoiler>") == 2
+    assert "<tg-spoiler>&lt;i&gt;yes&lt;/i&gt;</tg-spoiler>" in text
+    assert "\nClarification: <tg-spoiler>&lt;b&gt;why&lt;/b&gt; &amp; more</tg-spoiler>" in text
+    assert text.endswith("</tg-spoiler>")
+    # No-clarification rendering is unchanged (single spoiler).
+    plain, _ = extract_questions_from_text(WRITTEN_TEXT)
+    assert format_written_send_text(plain[0], 1).count("<tg-spoiler>") == 1
+
+
+def test_mcq_clarification_length_cap_rejected():
+    long_clar = "x" * (MAX_POLL_EXPLANATION_LENGTH + 1)
+    questions, skipped = extract_questions_from_text(
+        MCQ_TEXT + f"\nClarification: {long_clar}"
+    )
+    assert questions == []
+    assert len(skipped) == 1
+    assert "clarification" in skipped[0]["reason"].lower()
+    assert validate_question(
+        {"type": "mcq", "question": "Q?", "options": ["A", "B"],
+         "correct_option_id": 0, "answer_text": "",
+         "clarification": long_clar, "question_num": "1"}
+    ) is not None
+    ok = "x" * MAX_POLL_EXPLANATION_LENGTH
+    assert validate_question(
+        {"type": "mcq", "question": "Q?", "options": ["A", "B"],
+         "correct_option_id": 0, "answer_text": "",
+         "clarification": ok, "question_num": "1"}
+    ) is None
+
+
+def test_written_rendered_length_accounts_for_clarification():
+    fit_answer = "A" * 100
+    questions, skipped = extract_questions_from_text(
+        f"1. Q?\nAnswer: {fit_answer}"
+    )
+    assert skipped == []
+    assert validate_question(questions[0]) is None
+    # Same question with a huge clarification must be rejected, not truncated.
+    huge = "C" * 5000
+    q = {"type": "written", "question": "Q?", "options": [],
+         "correct_option_id": None, "answer_text": fit_answer,
+         "clarification": huge, "question_num": "1"}
+    assert validate_question(q) is not None
+    try:
+        format_written_send_text(q, 1)
+    except ValueError as e:
+        assert "too long" in str(e)
+    else:
+        raise AssertionError("expected ValueError for oversized clarification")
+
+
+def test_forwarded_poll_export_appends_explanation_only_when_present():
+    class _Opt:
+        def __init__(self, text):
+            self.text = text
+
+    class _Poll:
+        def __init__(self, explanation=None):
+            self.question = "Capital?"
+            self.options = [_Opt("Giza"), _Opt("Cairo")]
+            self.correct_option_id = 1
+            self.explanation = explanation
+
+    with_expl = asyncio.run(format_quiz_as_text(_Poll("Because Cairo."), 1))
+    assert "\nClarification: Because Cairo." in with_expl
+    assert with_expl.startswith("1. Capital?")
+    # Round-trips back through the parser.
+    parsed, skipped = extract_questions_from_text(with_expl)
+    assert skipped == []
+    assert parsed[0]["clarification"] == "Because Cairo."
+    without = asyncio.run(format_quiz_as_text(_Poll(None), 1))
+    assert "Clarification" not in without
+    assert "Answer: b) Cairo" in without
+    empty = asyncio.run(format_quiz_as_text(_Poll("   "), 1))
+    assert "Clarification" not in empty

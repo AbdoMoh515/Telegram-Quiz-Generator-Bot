@@ -100,7 +100,7 @@ With your virtual environment activated and your .env file configured, start the
 python main.py
 
 📝 Question Format
-Every question block starts with a number and ends with an `Answer:` line. Put exactly one blank line between blocks.
+Every question block starts with a number and requires an `Answer:` line; an optional clarification line may follow the `Answer:` line. Put exactly one blank line between blocks.
 
 Multiple choice (two or more options, single-letter answer):
 
@@ -114,3 +114,20 @@ Written (no options, free-text answer):
 
 2. Who wrote the novel 1984?
 Answer: George Orwell
+
+Optional user-supplied clarification (MCQ and written): add a separate
+line AFTER the Answer line in the same block. Labeled form (canonical for
+output) is `Clarification: ...`; `التوضيح: ...` (Arabic label, colon
+optional) and unlabeled free text on the line(s) after Answer are also
+accepted. The English label is case-insensitive. Only include it when you
+have extra context; it is never invented by the bot or the AI prompt.
+MCQ clarifications are sent as the Telegram quiz poll explanation (plain
+text, max 200 chars); written clarifications appear under the answer in
+their own spoiler. Example:
+
+1. What is the capital of Egypt?
+a) Giza
+b) Alexandria
+c) Cairo
+Answer: c
+Clarification: Cairo has been the capital since the Fatimid era.
