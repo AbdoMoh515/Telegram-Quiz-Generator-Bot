@@ -7,6 +7,8 @@ class UserState(StatesGroup):
     IDLE = State()
     WAITING_FOR_FILE = State()
     COLLECTING_QUIZZES = State()
+    COLLECTING_TEXT = State()
+    AWAITING_CONFIRMATION = State()
     ADMIN_PANEL = State()
     CHOOSING_USER_TO_ALLOW = State()
     CHOOSING_USER_TO_REMOVE = State()

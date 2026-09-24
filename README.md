@@ -2,18 +2,22 @@ Telegram Quiz Master Bot
 📖 Overview
 The Telegram Quiz Master Bot is a powerful and efficient tool designed to automate two primary tasks related to Telegram quizzes:
 
-Quiz Creation: It can take a formatted text file (.txt or .pdf) containing questions and answers and automatically generate anonymous Telegram quizzes from it.
+Quiz Creation: It can take a formatted text file (.txt or .md) containing questions and answers and automatically generate Telegram quizzes from it. Multiple-choice questions are sent as anonymous quiz polls; written questions are sent as ordinary messages with the answer hidden in a spoiler.
 
 Quiz Extraction: It can receive multiple forwarded Telegram quizzes and consolidate them into a single, neatly formatted text file.
 
 The bot features a secure, admin-only panel for user management and is built on a modern, asynchronous architecture using aiogram 3.x to ensure high performance and stability.
 
 ✨ Features
-Create Quizzes from File: Supports both .pdf and .txt file uploads.
+Create Quizzes from File: Supports `.txt` and `.md` file uploads (no PDF support).
+
+Collect Mode: Send questions over several messages, then finish for a preview.
+
+Preview Before Sending: Every parsed batch shows counts, sample questions and skipped reasons with explicit Send/Cancel controls. Nothing is sent without confirmation.
+
+Robust Question Parsing: Reliably extracts numbered multiple-choice questions (options plus `Answer: letter`) and numbered written questions (no options plus `Answer: text`) from structured text.
 
 Extract from Forwards: Intelligently collects forwarded quizzes and exports them to a single text file.
-
-Robust Question Parsing: Reliably extracts questions, options, and answers from structured text.
 
 Secure Admin Panel: Access is restricted to designated admin User IDs.
 
@@ -21,7 +25,7 @@ Interactive User Management: Admins can allow or remove users through a user-fri
 
 Access Control: Only admins and specifically allowed users can interact with the bot's features.
 
-AI Prompt Helper: Provides users with a ready-to-use prompt to format their questions correctly using an AI assistant.
+AI Prompt Helper: Provides users with a ready-to-use prompt to format both multiple-choice and written questions correctly using an AI assistant. The AI is instructed to reply with only one copy-ready fenced code block.
 
 High Performance:
 
@@ -88,23 +92,25 @@ pip install -r requirements.txt
 
 Configure Environment Variables
 
-Create a file named .env in the root of your project directory.
-
-Copy the content from the example below and fill in your details.
-
-.env file content:
-
-# Get this token from Telegram's @BotFather
-TELEGRAM_TOKEN="YOUR_TELEGRAM_BOT_TOKEN_HERE"
-
-# A list of admin Telegram User IDs, separated by commas (no spaces)
-# Get your ID from @userinfobot
-ADMIN_IDS="123456789,987654321"
-
-# (Optional) The ID of a channel where the bot can log errors
-LOG_CHANNEL_ID="-1001234567890"
+Copy `.env.example` to `.env` in the project root and replace the placeholder token and admin ID. Optional settings and their defaults are documented in the example file. Keep `.env` private.
 
 ▶️ How to Run
 With your virtual environment activated and your .env file configured, start the bot with this simple command:
 
 python main.py
+
+📝 Question Format
+Every question block starts with a number and ends with an `Answer:` line. Put exactly one blank line between blocks.
+
+Multiple choice (two or more options, single-letter answer):
+
+1. What is the capital of Egypt?
+a) Giza
+b) Alexandria
+c) Cairo
+Answer: c
+
+Written (no options, free-text answer):
+
+2. Who wrote the novel 1984?
+Answer: George Orwell

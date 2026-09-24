@@ -6,6 +6,7 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     """Create the main keyboard, adding admin and utility buttons."""
     keyboard_buttons = [
         [KeyboardButton(text="📝 Create Quiz")],
+        [KeyboardButton(text="🧩 Collect Messages")],
         [KeyboardButton(text="📥 Extract Quizzes from Forwards")],
         [KeyboardButton(text="❓ Help"), KeyboardButton(text="🤖 Get AI Prompt")]
     ]
@@ -42,4 +43,20 @@ def create_user_selection_keyboard(users: List[Dict], action_prefix: str) -> Inl
     buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_preview_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Send/Cancel controls for the parsed-question preview step."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Send", callback_data=f"confirm_send:{token}")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_send:{token}")],
+    ])
+
+
+def get_collect_keyboard() -> InlineKeyboardMarkup:
+    """Finish/Cancel controls for the collect-messages mode."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Finish", callback_data="collect_finish")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="collect_cancel")],
+    ])
 

@@ -19,6 +19,10 @@ from handlers import (
     cancel_extraction_callback,
     show_questions_callback,
     cancel_processing_callback,
+    confirm_send_callback,
+    cancel_send_callback,
+    collect_finish_callback,
+    collect_cancel_callback,
     handle_text_message
 )
 from handlers_admin import (
@@ -59,6 +63,10 @@ async def main():
     dp.callback_query.register(cancel_extraction_callback, F.data == "cancel_extraction")
     dp.callback_query.register(show_questions_callback, F.data == "show_questions")
     dp.callback_query.register(cancel_processing_callback, F.data == "cancel_processing")
+    dp.callback_query.register(confirm_send_callback, F.data.startswith("confirm_send:"))
+    dp.callback_query.register(cancel_send_callback, F.data.startswith("cancel_send:"))
+    dp.callback_query.register(collect_finish_callback, F.data == "collect_finish")
+    dp.callback_query.register(collect_cancel_callback, F.data == "collect_cancel")
 
     dp.callback_query.register(handle_allow_user_callback, F.data.startswith("allow:"))
     dp.callback_query.register(handle_remove_user_callback, F.data.startswith("remove:"))

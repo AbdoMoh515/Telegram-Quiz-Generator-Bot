@@ -32,3 +32,10 @@ var/
 *.log
 logs/
 bot.log
+
+# Pytest cache
+.pytest_cache/
+pytest-cache-files-*/
+
+# Runtime temp files
+temp/
