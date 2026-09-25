@@ -388,35 +388,6 @@ def test_approve_write_failure_is_retriable_single_dm():
         asyncio.run(_main())
 
 
-def test_manual_remove_rearms_request_and_start_renotifies():
-    async def _main():
-        bot = FakeBot()
-        msg, state = _start(uid=42, bot=bot)
-        await handlers.start_command(msg, state)
-        cb = FakeCallback("approve:42", FakeUser(ADMIN_A), bot=bot)
-        await handlers_admin.handle_approve_callback(cb, bot)
-        assert filedb.is_user_allowed(42)
-        # Manual remove via the admin panel reconciles the request row.
-        rm_cb = FakeCallback("remove:42", FakeUser(ADMIN_A), bot=bot)
-        await handlers_admin.handle_remove_user_callback(rm_cb, FakeState())
-        assert not filedb.is_user_allowed(42)
-        assert access_requests.get_request(42)["status"] == "expired"
-        # Next /start files a FRESH request: admins re-notified, no
-        # welcome for the now-unauthorized user.
-        bot.sent.clear()
-        msg2, state2 = _start(uid=42, bot=bot)
-        await handlers.start_command(msg2, state2)
-        admin_dms = [s for s in bot.sent
-                     if s["chat_id"] in (ADMIN_A, ADMIN_B)]
-        assert len(admin_dms) == 2
-        assert not msg2.answers
-        assert any("access request has been sent" in r["text"].lower()
-                   for r in msg2.replies)
-
-    with isolated_env([ADMIN_A, ADMIN_B]):
-        asyncio.run(_main())
-
-
 def test_start_with_stale_approved_record_renotifies():
     async def _main():
         bot = FakeBot()
@@ -425,8 +396,9 @@ def test_start_with_stale_approved_record_renotifies():
         cb = FakeCallback("approve:42", FakeUser(ADMIN_A), bot=bot)
         await handlers_admin.handle_approve_callback(cb, bot)
         assert filedb.is_user_allowed(42)
-        # Overlapping change that bypassed the request record (e.g. a
-        # direct allowed-list edit): approved row, unauthorized user.
+        # Overlapping change that bypassed the request record (a manual
+        # server-side edit of allowed_users.json, the only way to revoke
+        # access): approved row, unauthorized user.
         assert filedb.remove_allowed_user(42)
         assert access_requests.get_request(42)["status"] == "approved"
         bot.sent.clear()

@@ -32,8 +32,6 @@ from handlers import (
 from handlers_admin import (
     myaccess_command,
     AccessControlMiddleware,
-    handle_allow_user_callback,
-    handle_remove_user_callback,
     handle_admin_cancel_callback,
     handle_approve_callback,
     handle_reject_callback,
@@ -69,8 +67,6 @@ async def main():
     dp.callback_query.register(collect_finish_callback, F.data == "collect_finish")
     dp.callback_query.register(collect_cancel_callback, F.data == "collect_cancel")
 
-    dp.callback_query.register(handle_allow_user_callback, F.data.startswith("allow:"))
-    dp.callback_query.register(handle_remove_user_callback, F.data.startswith("remove:"))
     dp.callback_query.register(handle_admin_cancel_callback, F.data == "admin_cancel")
     dp.callback_query.register(handle_approve_callback, F.data.startswith("approve:"))
     dp.callback_query.register(handle_reject_callback, F.data.startswith("reject:"))

@@ -32,9 +32,9 @@ The project is organized into the following key files:
 
 ### `handlers_admin.py`
 
-- **`allow_user_command()`**: An admin command to grant a user access to the bot.
-- **`removeuser_command()`**: An admin command to revoke a user's access.
 - **`AccessControlMiddleware`**: A middleware that checks if a user is authorized to use the bot before processing their message.
+- **Access requests**: New users are approved only via the Approve/Reject buttons on the request message DM'd to admins when an unapproved user sends `/start` (the `_handle_access_decision` path in `handlers_admin.py`). There are no manual allow/remove commands or buttons.
+- **Revocation**: Removing an approved user is a manual server-side edit of `allowed_users.json`, followed by a service restart (the bot caches allowed users at startup). The removed user's next `/start` files a fresh access request.
 
 ### `utils.py`
 

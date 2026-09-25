@@ -5,18 +5,17 @@ from aiogram import types, BaseMiddleware
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
-from filedb import is_user_allowed, add_allowed_user_from_user, list_allowed_users, list_all_users, get_user_by_id, remove_allowed_user
+from filedb import is_user_allowed, add_allowed_user_from_user, get_user_by_id
 from access_requests import (
     aresolve_request,
     alist_admin_messages,
     areopen_approved_request,
-    aexpire_request_on_manual_remove,
     build_access_request_text,
     STATUS_APPROVED,
     STATUS_REJECTED,
 )
 from config import ADMIN_IDS
-from keyboards import get_main_keyboard, get_admin_keyboard, create_user_selection_keyboard
+from keyboards import get_main_keyboard, get_admin_keyboard
 from states import UserState
 
 logger = logging.getLogger(__name__)
@@ -78,66 +77,9 @@ async def myaccess_command(message: Message):
 
 async def handle_admin_text_message(message: Message, state: FSMContext):
     text = message.text
-    if text == "✅ Allow User":
-        await state.set_state(UserState.CHOOSING_USER_TO_ALLOW)
-        all_user_ids = {u['id'] for u in list_all_users()}
-        allowed_user_ids = {u['id'] for u in list_allowed_users()}
-        unallowed_ids = all_user_ids - allowed_user_ids
-        unallowed_users = [get_user_by_id(uid) for uid in unallowed_ids if get_user_by_id(uid)]
-        
-        if not unallowed_users:
-            await message.answer("All known users are already on the allowed list.", reply_markup=get_admin_keyboard())
-            await state.set_state(UserState.ADMIN_PANEL)
-            return
-        
-        keyboard = create_user_selection_keyboard(unallowed_users, "allow")
-        await message.answer("Select a user to allow:", reply_markup=keyboard)
-
-    elif text == "❌ Remove User":
-        await state.set_state(UserState.CHOOSING_USER_TO_REMOVE)
-        allowed_users = list_allowed_users()
-        if not allowed_users:
-            await message.answer("There are no users on the allowed list to remove.", reply_markup=get_admin_keyboard())
-            await state.set_state(UserState.ADMIN_PANEL)
-            return
-            
-        keyboard = create_user_selection_keyboard(allowed_users, "remove")
-        await message.answer("Select a user to remove:", reply_markup=keyboard)
-
-    elif text == "⬅️ Back to Main Menu":
+    if text == "⬅️ Back to Main Menu":
         await state.set_state(UserState.IDLE)
         await message.answer("⬅️ Returning to the main menu.", reply_markup=get_main_keyboard(message.from_user.id))
-
-async def handle_allow_user_callback(callback_query: CallbackQuery, state: FSMContext):
-    user_id_to_add = int(callback_query.data.split(":")[1])
-    user_to_add = get_user_by_id(user_id_to_add)
-    
-    if user_to_add and add_allowed_user_from_user(user_to_add):
-        await callback_query.message.edit_text(f"✅ User <b>{user_to_add.get('first_name')}</b> (<code>{user_id_to_add}</code>) has been allowed.")
-    else:
-        await callback_query.message.edit_text(f"❌ Failed to allow user <code>{user_id_to_add}</code>.")
-    await callback_query.answer()
-    await state.set_state(UserState.ADMIN_PANEL)
-
-async def handle_remove_user_callback(callback_query: CallbackQuery, state: FSMContext):
-    user_id_to_remove = int(callback_query.data.split(":")[1])
-    user_to_remove = get_user_by_id(user_id_to_remove)
-    
-    if user_to_remove and remove_allowed_user(user_id_to_remove):
-        # Reconcile the request record: without this the removed user
-        # keeps an "approved" row and their next /start would welcome
-        # them without notifying any admin. Expiring it makes the next
-        # /start file a fresh request.
-        try:
-            await aexpire_request_on_manual_remove(user_id_to_remove)
-        except Exception as e:
-            logger.warning(f"Could not expire access request for removed "
-                           f"user {user_id_to_remove}: {e}")
-        await callback_query.message.edit_text(f"🗑 User <b>{user_to_remove.get('first_name')}</b> (<code>{user_id_to_remove}</code>) has been removed.")
-    else:
-        await callback_query.message.edit_text(f"❌ Failed to remove user <code>{user_id_to_remove}</code>.")
-    await callback_query.answer()
-    await state.set_state(UserState.ADMIN_PANEL)
 
 async def handle_admin_cancel_callback(callback_query: CallbackQuery, state: FSMContext):
     await callback_query.message.delete()
@@ -272,7 +214,8 @@ async def _handle_access_decision_locked(callback_query: CallbackQuery,
             else:
                 await callback_query.answer(
                     "⚠️ Approved, but saving to the allowed list failed -- "
-                    "please allow the user manually from the Admin Panel.",
+                    "please retry later or edit allowed_users.json on the "
+                    "server, then restart the bot.",
                     show_alert=True)
             return
         outcome_line = (f"✅ Approved by admin <code>{admin_id}</code>.")
