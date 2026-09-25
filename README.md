@@ -25,6 +25,10 @@ Interactive User Management: Admins can allow or remove users through a user-fri
 
 Access Control: Only admins and specifically allowed users can interact with the bot's features.
 
+Access Requests: When an unapproved user sends `/start`, every admin gets a DM with inline Approve/Reject buttons (escaped username when present, full name, numeric ID). Repeat `/start` never spams admins; races resolve to a single winner and all admin notifications are retired with the outcome. See "Access requests" below.
+
+Upload Queue: All `.txt`/`.md` document uploads share one global FIFO queue with at most two concurrent workers; parsing streams from disk in bounded memory with no per-file content cap. See "Upload queue & resource model" below.
+
 AI Prompt Helper: Provides users with a ready-to-use prompt to format both multiple-choice and written questions correctly using an AI assistant. The AI is instructed to reply with only one copy-ready fenced code block.
 
 High Performance:
@@ -131,3 +135,25 @@ b) Alexandria
 c) Cairo
 Answer: c
 Clarification: Cairo has been the capital since the Fatimid era.
+
+📥 Upload queue & resource model
+Every `.txt`/`.md` DOCUMENT upload -- from any user -- joins a single global FIFO queue, and at most TWO uploads download/parse at the same time. The message handler itself never downloads: it only enqueues small metadata (job id, user/chat ids, Telegram file id, file name) and tells you your queue position, so extra uploads wait fairly instead of downloading concurrently.
+
+Tradeoffs and limits, stated plainly:
+
+- No per-file content-size cap: files are streamed from disk in fixed-size chunks and split into numbered question blocks, so a gigabyte-sized file uses roughly the same RAM as a tiny one (one block plus one read chunk). Duplicate detection is disk-backed too (a job-local SQLite UNIQUE index on question-text hashes, removed after the parse), so RAM stays flat no matter how many questions an upload holds.
+- One guard remains per single question, not per file: a block bigger than 32 KiB (`MAX_UPLOAD_BLOCK_CHARS` in `utils.py`) is skipped with a reason instead of being buffered indefinitely.
+- "No cap" does not mean infinite capacity. Two hard platform limits still apply and produce clear errors instead of silent failure: Telegram's Bot API lets bots download files up to 20 MB (larger files are refused at download), and a full disk aborts processing with a disk-full notice. A parse failure (disk-full, decoding/read error) notifies the affected user, drops the partial spool, and the worker moves on to the next queued upload -- one bad file never stalls the FIFO.
+- Parsed questions live on disk (`temp/uploads/jobs/<job-id>/questions.jsonl`, one JSON object per line) from parse through preview, dispatch and Show-as-Text; FSM state only ever holds small identifiers (job id, token, counts) -- there is deliberately no per-upload list in FSM, so repeated uploads (including failed and empty ones) cannot grow it. Preview samples, dispatch and the Show-as-Text export all stream from disk in bounded memory.
+- Upload preview buttons are bound to their owner: ✅ Send / ❌ Cancel taps are checked against the job's user/chat before the token is claimed, so a foreign press is refused without consuming, dispatching, or cancelling anything. Confirm/cancel only hold the claim lock for the quick token check-and-claim; the 0.5s-per-question dispatch and all disk/network cleanup run outside it, so one large upload never blocks other users' Send/Cancel.
+- Pasted text, Collect mode and forwarded polls keep their current in-memory behavior (including the existing paste/collect caps) -- uploads are the only path that changed.
+- Disk I/O runs in worker threads (`asyncio.to_thread`), never blocking the event loop; downloads happen only inside worker slots. Age-based cleanup (24 h TTL) plus cleanup on failure/cancel keeps the spool from growing forever.
+- Restart behavior: at startup the bot re-queues spooled uploads that never started (oldest first) and re-registers live previews, so preview buttons sent before a restart keep working. Results whose files are gone answer "expired, please re-upload" instead of failing obscurely. Override the spool location with the `BOT_TEMP_DIR` environment variable (default `temp/`, already git-ignored); tests always use isolated temp dirs.
+
+🔐 Access requests (admin approvals)
+- An unapproved user sending `/start` is recorded (username + full name refreshed on every `/start` via `upsert_user`, older fields preserved) and gets a "pending review" notice. Admins and already-approved users never trigger requests.
+- Each id in `ADMIN_IDS` receives a DM showing the safely HTML-escaped Telegram username when present, the Telegram full name (first + last) and the numeric ID, with inline ✅ Approve / ❌ Reject buttons that act directly on the request.
+- Anti-spam: repeat `/start` while a request is pending only reminds the user -- admins are not re-notified. A rejected user stays rejected on repeat `/start` (no new notifications); admins can still allow them manually from the Admin Panel.
+- Races and stale taps: resolving is an atomic compare-and-set, so exactly one admin wins; losers and repeat tappers get "Already resolved", and taps for unknown requests get "no longer pending". Concurrent taps for the SAME user are additionally serialized on a per-user lock from resolve through button-retire, so a second admin tapping during the winner's allowed-list write waits instead of retiring live buttons mid-write; on write failure the request re-opens with buttons still live and the waiter retries, with exactly one user DM ever sent. Approving notifies the user, adds them to the allowed list, and edits every admin notification to show the outcome with buttons removed (best effort per message). Non-admin taps are refused.
+- Transactional approve: if the allowed-list write fails after an admin wins the race, the request is sent back to pending (buttons stay live, the user is NOT notified) so a later Approve tap can retry -- at most one tap ever sends the user DM. A manual Remove from the Admin Panel expires the approved request, so the removed user's next `/start` files a fresh request instead of being welcomed on a stale record; `/start` never welcomes on the request record alone (the allowed list is the source of truth).
+- Requests live in a small stdlib-SQLite database under the ignored temp dir (`temp/access_requests.db`, 7-day pending TTL) -- never in the tracked `users.json` / `allowed_users.json`, which are only written by live admin allow/remove/approve actions. `/help` and `/myaccess` stay public; everything else stays behind the access gate.

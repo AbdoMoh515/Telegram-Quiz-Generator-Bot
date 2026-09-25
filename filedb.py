@@ -49,17 +49,32 @@ def _save_json_internal(filename: str, data: List[Dict]):
 
 # --- Public Thread-safe Functions ---
 
-def upsert_user(user_id: int, username: str, first_name: str) -> bool:
-    """Adds a user to the main user list if they don't exist. Thread-safe."""
+def upsert_user(user_id: int, username: str, first_name: str,
+                last_name: str = "") -> bool:
+    """Records a user, refreshing stored names to the newest seen values.
+
+    New users are appended with ``date_joined``; existing users keep all
+    their stored fields (including ``date_joined`` and any unknown extras)
+    while ``username``/``first_name``/``last_name`` are updated so admin
+    views and access requests always show current data. The optional
+    ``last_name`` keeps older 3-argument calls working. Thread-safe.
+    """
     with _file_lock:
         users = _load_json_internal(USERS_FILE)
-        if any(u['id'] == user_id for u in users):
-            return True  # Already exists
+        for existing in users:
+            if existing.get('id') == user_id:
+                existing['username'] = username or ''
+                existing['first_name'] = first_name or ''
+                if last_name or 'last_name' not in existing:
+                    existing['last_name'] = last_name or ''
+                _save_json_internal(USERS_FILE, users)
+                return True
 
         user_entry = {
             'id': user_id,
             'username': username or '',
             'first_name': first_name or '',
+            'last_name': last_name or '',
             'date_joined': datetime.now().isoformat()
         }
         users.append(user_entry)

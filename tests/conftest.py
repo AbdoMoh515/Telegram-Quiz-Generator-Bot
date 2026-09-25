@@ -29,6 +29,14 @@ class _Holder:
         self.args = args
 
 
+class _MessageHolder(_Holder):
+    """Distinct stub so isinstance(x, Message) is False for callbacks."""
+
+
+class _CallbackQueryHolder(_Holder):
+    """Distinct stub so isinstance(x, CallbackQuery) is False for messages."""
+
+
 def _ensure_aiogram_stubs():
     try:
         import aiogram  # noqa: F401
@@ -55,8 +63,8 @@ def _ensure_aiogram_stubs():
 
     types_mod = _install(
         "aiogram.types",
-        Message=_Holder,
-        CallbackQuery=_Holder,
+        Message=_MessageHolder,
+        CallbackQuery=_CallbackQueryHolder,
         FSInputFile=_Holder,
         Poll=_Holder,
         InlineKeyboardMarkup=_Holder,

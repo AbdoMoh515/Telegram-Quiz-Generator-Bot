@@ -2,8 +2,10 @@
 
 import asyncio
 import os
+import tempfile
 
 import handlers
+import upload_queue
 from states import UserState
 
 MIXED = """1. What is the capital of Egypt?
@@ -214,12 +216,53 @@ def test_handle_file_rejects_pdf():
 
 
 def test_handle_file_txt_goes_to_preview():
-    state = FakeState()
-    bot = FakeBot()
-    msg = FakeMessage(bot=bot)
-    msg.document = type("Doc", (), {"file_name": "quiz.md"})()
-    asyncio.run(handlers.handle_file(msg, state))
-    assert asyncio.run(state.get_state()) == UserState.AWAITING_CONFIRMATION
+    async def _run():
+        upload_queue.reset_for_tests()
+        state = FakeState()
+        bot = FakeBot()
+        msg = FakeMessage(bot=bot)
+        msg.document = type(
+            "Doc", (), {"file_name": "quiz.md", "file_id": "fid-1"})()
+        await handlers.handle_file(msg, state)
+        # The handler only queues: no download or parse yet, and no
+        # unbounded per-upload list in FSM (each preview is tracked by
+        # its own small job id / token pair once delivered).
+        data = await state.get_data()
+        assert "pending_upload_ids" not in data
+        assert upload_queue.pending_count() == 1
+        assert "Queued" in msg.replies[-1]["text"] \
+            or "Processing" in msg.replies[-1]["text"]
+        presented = {}
+
+        async def _present(bot, chat_id, text, token):
+            presented["text"] = text
+            presented["token"] = token
+            return FakeMessage(bot=bot)
+
+        await upload_queue.process_one(
+            bot, presenter=_present,
+            fsm_factory=lambda chat_id, user_id: state,
+            awaiting_state=UserState.AWAITING_CONFIRMATION)
+        assert "Preview" in presented["text"]
+        assert await state.get_state() == UserState.AWAITING_CONFIRMATION
+        data = await state.get_data()
+        assert data["preview_job_id"]
+        assert data["preview_token"] == presented["token"]
+        # Question records live on disk, not in FSM.
+        assert "preview_questions" not in data
+        assert os.path.exists(
+            upload_queue.questions_path(data["preview_job_id"]))
+
+    previous = os.environ.get("BOT_TEMP_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["BOT_TEMP_DIR"] = tmp
+        try:
+            asyncio.run(_run())
+        finally:
+            if previous is None:
+                os.environ.pop("BOT_TEMP_DIR", None)
+            else:
+                os.environ["BOT_TEMP_DIR"] = previous
 
 
 class FakeOption:

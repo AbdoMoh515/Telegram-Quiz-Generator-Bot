@@ -7,11 +7,14 @@
 # below are optional and only required by send_telegram_quizzes() at runtime.
 
 import asyncio
+import hashlib
 import html
+import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 try:  # pragma: no cover - runtime-only dependency
     from aiogram import Bot
@@ -44,6 +47,18 @@ MAX_POLL_EXPLANATION_LENGTH = 200
 MAX_INPUT_CHARS = 200_000
 MAX_COLLECT_MESSAGES = 50
 MAX_COLLECT_CHARS = 100_000
+
+#: Max characters buffered for a single question block when streaming an
+#: uploaded file from disk. A block (one numbered question) bigger than this
+#: is skipped with a reason instead of being buffered indefinitely.
+MAX_UPLOAD_BLOCK_CHARS = 32_768
+
+#: How much of a spooled upload to read per disk chunk while streaming.
+UPLOAD_READ_CHUNK_CHARS = 65_536
+
+#: How long a parsed upload result stays on disk for Show-as-Text/export
+#: after dispatch before age-based cleanup may remove it (hours).
+UPLOAD_RESULT_TTL_SECONDS = 24 * 3600
 
 #: How much of the preview to show.
 PREVIEW_MAX_QUESTIONS_SHOWN = 3
@@ -325,176 +340,7 @@ def extract_questions_from_text(
         if not block:
             continue
         try:
-            header = _HEADER_RE.match(block)
-            if not header:
-                skipped.append({
-                    "number": f"Block {i + 1}",
-                    "reason": "Could not find question number or text.",
-                })
-                continue
-            question_num = header.group(1)
-
-            answer_match = _ANSWER_RE.search(block)
-            if not answer_match:
-                skipped.append({
-                    "number": question_num,
-                    "reason": "No answer line found (expected 'Answer: ...').",
-                })
-                continue
-            answer_raw = _collapse(answer_match.group(1))
-            if not answer_raw:
-                skipped.append({"number": question_num, "reason": "Empty answer text."})
-                continue
-
-            # Optional user-supplied clarification: line(s) AFTER the Answer
-            # line in the same block. Labeled ("Clarification:"/"التوضيح:",
-            # English case-insensitive, optional colon) or unlabeled free
-            # text. The Answer itself stays exactly the single Answer line;
-            # clarification is never mistaken for an option (only pre-answer
-            # lines are scanned for options) nor for a next question (blocks
-            # are split on numbering). Absent -> "" (never fabricated).
-            clarification = _parse_clarification(block[answer_match.end():])
-
-            # Option lines are only recognised BEFORE the Answer line, so a
-            # written answer can never be mistaken for an option.
-            pre_answer = block[: answer_match.start()]
-            option_matches = _OPTION_LINE_RE.findall(pre_answer)
-
-            if len(option_matches) >= 2:
-                # ---------------- MCQ candidate ----------------
-                letters = [m[0].lower() for m in option_matches]
-                if len(set(letters)) != len(letters):
-                    skipped.append({
-                        "number": question_num,
-                        "reason": f"Duplicate option letters {letters}.",
-                    })
-                    continue
-                options = [_collapse(m[1]) for m in option_matches]
-                if any(not o for o in options):
-                    skipped.append({
-                        "number": question_num,
-                        "reason": "Found an empty option.",
-                    })
-                    continue
-                letter_match = _SINGLE_LETTER_RE.match(answer_raw)
-                correct_letter: Optional[str] = None
-                if letter_match:
-                    correct_letter = letter_match.group(1).lower()
-                else:
-                    # Tolerate the forwarded-export style "Answer: c) Cairo":
-                    # a letter followed by ")" and the option text itself.
-                    export_match = re.match(
-                        r"^([A-Za-z])\s*[)]\s*(.+?)\s*$", answer_raw
-                    )
-                    if export_match:
-                        letter = export_match.group(1).lower()
-                        rest = _collapse(export_match.group(2))
-                        if letter in letters and options[
-                            letters.index(letter)
-                        ].lower() == rest.lower():
-                            correct_letter = letter
-                    if correct_letter is None:
-                        skipped.append({
-                            "number": question_num,
-                            "reason": (
-                                f"Answer {answer_raw!r} is not a single option "
-                                f"letter, yet {len(option_matches)} options were found."
-                            ),
-                        })
-                        continue
-                if correct_letter not in letters:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": (
-                            f'Correct answer letter "{correct_letter}" '
-                            f"not in options {letters}."
-                        ),
-                    })
-                    continue
-                first_option_pos = _OPTION_LINE_RE.search(pre_answer)
-                assert first_option_pos is not None
-                # Question text = everything between the "N." header and the
-                # first option line, with the header marker stripped.
-                head_line_end = block.find("\n")
-                head_first_line = block if head_line_end == -1 else block[:head_line_end]
-                head_text = re.sub(
-                    r"^\s*(?:Q\s*)?\d+\s*[.\-)]\s*", "", head_first_line
-                )
-                middle = pre_answer[len(head_first_line):first_option_pos.start()]
-                question_text = _collapse(head_text + " " + middle)
-                if not question_text:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": "Empty question text.",
-                    })
-                    continue
-                if question_text in seen_texts:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": "Duplicate question.",
-                    })
-                    continue
-                candidate = make_mcq(
-                    question_num, question_text, options,
-                    letters.index(correct_letter),
-                    clarification,
-                )
-                too_long = validate_question(candidate)
-                if too_long is not None:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": too_long,
-                    })
-                    continue
-                questions.append(candidate)
-                seen_texts.add(question_text)
-            elif len(option_matches) == 1:
-                # ---------------- Ambiguous: neither clearly MCQ nor
-                # written. Never guess: skip as incomplete.
-                skipped.append({
-                    "number": question_num,
-                    "reason": (
-                        "Found only 1 option line: not a valid MCQ "
-                        "(needs 2+ options) nor a written question "
-                        "(needs no options)."
-                    ),
-                })
-                continue
-            else:
-                # ---------------- Written candidate ----------------
-                # No option lines at all, so the answer is free text --
-                # even a single letter is a written answer here, never
-                # mistaken for an MCQ.
-                head_line_end = block.find("\n")
-                head_first_line = block if head_line_end == -1 else block[:head_line_end]
-                head_text = re.sub(
-                    r"^\s*(?:Q\s*)?\d+\s*[.\-)]\s*", "", head_first_line
-                )
-                middle = pre_answer[len(head_first_line):]
-                question_text = _collapse(head_text + " " + middle)
-                if not question_text:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": "Empty question text.",
-                    })
-                    continue
-                if question_text in seen_texts:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": "Duplicate question.",
-                    })
-                    continue
-                candidate = make_written(question_num, question_text, answer_raw,
-                                         clarification)
-                too_long = validate_question(candidate)
-                if too_long is not None:
-                    skipped.append({
-                        "number": question_num,
-                        "reason": too_long,
-                    })
-                    continue
-                questions.append(candidate)
-                seen_texts.add(question_text)
+            question, skip = _parse_single_block(block, f"Block {i + 1}", seen_texts)
         except Exception as e:
             logger.error(
                 f"Error processing block {i + 1}: {e}\nContent: {block[:200]}...",
@@ -504,6 +350,11 @@ def extract_questions_from_text(
                 "number": f"Block {i + 1}",
                 "reason": f"An unexpected error occurred: {e}",
             })
+            continue
+        if question is not None:
+            questions.append(question)
+        elif skip is not None:
+            skipped.append(skip)
 
     # Prefix-aware batch check: dispatch numbers questions sequentially from
     # ``start_number`` (the bot sends from 1), so an MCQ that fits under its
@@ -529,6 +380,177 @@ def extract_questions_from_text(
                 break
 
     return questions, skipped
+
+
+def _parse_single_block(
+    block: str, label: str, seen_texts
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
+    """Parse one stripped question *block*.
+
+    Shared by the in-memory parser and the streaming upload parser so both
+    accept exactly the same input. Returns ``(question, None)`` on success,
+    ``(None, skipped_entry)`` when the block is rejected, and raises only on
+    truly unexpected errors (the callers convert those to skipped entries).
+    ``seen_texts`` only needs ``__contains__``/``add``: the in-memory
+    parser passes a ``set``, the streaming parser a disk-backed
+    :class:`_DiskSeenTexts`, with identical duplicate semantics.
+    """
+    header = _HEADER_RE.match(block)
+    if not header:
+        return None, {
+            "number": label,
+            "reason": "Could not find question number or text.",
+        }
+    question_num = header.group(1)
+
+    answer_match = _ANSWER_RE.search(block)
+    if not answer_match:
+        return None, {
+            "number": question_num,
+            "reason": "No answer line found (expected 'Answer: ...').",
+        }
+    answer_raw = _collapse(answer_match.group(1))
+    if not answer_raw:
+        return None, {"number": question_num, "reason": "Empty answer text."}
+
+    # Optional user-supplied clarification: line(s) AFTER the Answer
+    # line in the same block. Labeled ("Clarification:"/"التوضيح:",
+    # English case-insensitive, optional colon) or unlabeled free
+    # text. The Answer itself stays exactly the single Answer line;
+    # clarification is never mistaken for an option (only pre-answer
+    # lines are scanned for options) nor for a next question (blocks
+    # are split on numbering). Absent -> "" (never fabricated).
+    clarification = _parse_clarification(block[answer_match.end():])
+
+    # Option lines are only recognised BEFORE the Answer line, so a
+    # written answer can never be mistaken for an option.
+    pre_answer = block[: answer_match.start()]
+    option_matches = _OPTION_LINE_RE.findall(pre_answer)
+
+    if len(option_matches) >= 2:
+        # ---------------- MCQ candidate ----------------
+        letters = [m[0].lower() for m in option_matches]
+        if len(set(letters)) != len(letters):
+            return None, {
+                "number": question_num,
+                "reason": f"Duplicate option letters {letters}.",
+            }
+        options = [_collapse(m[1]) for m in option_matches]
+        if any(not o for o in options):
+            return None, {
+                "number": question_num,
+                "reason": "Found an empty option.",
+            }
+        letter_match = _SINGLE_LETTER_RE.match(answer_raw)
+        correct_letter: Optional[str] = None
+        if letter_match:
+            correct_letter = letter_match.group(1).lower()
+        else:
+            # Tolerate the forwarded-export style "Answer: c) Cairo":
+            # a letter followed by ")" and the option text itself.
+            export_match = re.match(
+                r"^([A-Za-z])\s*[)]\s*(.+?)\s*$", answer_raw
+            )
+            if export_match:
+                letter = export_match.group(1).lower()
+                rest = _collapse(export_match.group(2))
+                if letter in letters and options[
+                    letters.index(letter)
+                ].lower() == rest.lower():
+                    correct_letter = letter
+            if correct_letter is None:
+                return None, {
+                    "number": question_num,
+                    "reason": (
+                        f"Answer {answer_raw!r} is not a single option "
+                        f"letter, yet {len(option_matches)} options were found."
+                    ),
+                }
+        if correct_letter not in letters:
+            return None, {
+                "number": question_num,
+                "reason": (
+                    f'Correct answer letter "{correct_letter}" '
+                    f"not in options {letters}."
+                ),
+            }
+        first_option_pos = _OPTION_LINE_RE.search(pre_answer)
+        assert first_option_pos is not None
+        # Question text = everything between the "N." header and the
+        # first option line, with the header marker stripped.
+        head_line_end = block.find("\n")
+        head_first_line = block if head_line_end == -1 else block[:head_line_end]
+        head_text = re.sub(
+            r"^\s*(?:Q\s*)?\d+\s*[.\-)]\s*", "", head_first_line
+        )
+        middle = pre_answer[len(head_first_line):first_option_pos.start()]
+        question_text = _collapse(head_text + " " + middle)
+        if not question_text:
+            return None, {
+                "number": question_num,
+                "reason": "Empty question text.",
+            }
+        if question_text in seen_texts:
+            return None, {
+                "number": question_num,
+                "reason": "Duplicate question.",
+            }
+        candidate = make_mcq(
+            question_num, question_text, options,
+            letters.index(correct_letter),
+            clarification,
+        )
+        too_long = validate_question(candidate)
+        if too_long is not None:
+            return None, {
+                "number": question_num,
+                "reason": too_long,
+            }
+        seen_texts.add(question_text)
+        return candidate, None
+    elif len(option_matches) == 1:
+        # ---------------- Ambiguous: neither clearly MCQ nor
+        # written. Never guess: skip as incomplete.
+        return None, {
+            "number": question_num,
+            "reason": (
+                "Found only 1 option line: not a valid MCQ "
+                "(needs 2+ options) nor a written question "
+                "(needs no options)."
+            ),
+        }
+    else:
+        # ---------------- Written candidate ----------------
+        # No option lines at all, so the answer is free text --
+        # even a single letter is a written answer here, never
+        # mistaken for an MCQ.
+        head_line_end = block.find("\n")
+        head_first_line = block if head_line_end == -1 else block[:head_line_end]
+        head_text = re.sub(
+            r"^\s*(?:Q\s*)?\d+\s*[.\-)]\s*", "", head_first_line
+        )
+        middle = pre_answer[len(head_first_line):]
+        question_text = _collapse(head_text + " " + middle)
+        if not question_text:
+            return None, {
+                "number": question_num,
+                "reason": "Empty question text.",
+            }
+        if question_text in seen_texts:
+            return None, {
+                "number": question_num,
+                "reason": "Duplicate question.",
+            }
+        candidate = make_written(question_num, question_text, answer_raw,
+                                 clarification)
+        too_long = validate_question(candidate)
+        if too_long is not None:
+            return None, {
+                "number": question_num,
+                "reason": too_long,
+            }
+        seen_texts.add(question_text)
+        return candidate, None
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +660,8 @@ def _preview_line(q: Dict[str, Any], number: int) -> str:
 
 
 def build_preview_text(
-    questions: List[Dict[str, Any]], skipped: List[Dict[str, str]]
+    questions: List[Dict[str, Any]], skipped: List[Dict[str, str]],
+    total_valid: Optional[int] = None, total_skipped: Optional[int] = None,
 ) -> str:
     """HTML preview: counts, representative questions, skipped reasons.
 
@@ -646,28 +669,35 @@ def build_preview_text(
     the output never contains a half-cut HTML entity. The total is bounded
     by dropping whole skipped lines (never by cutting the final HTML), so
     tags stay balanced and the Send/Cancel instructions are always kept.
+
+    *questions*/*skipped* may be bounded samples loaded from disk; pass the
+    real totals via *total_valid*/*total_skipped* in that case (defaults
+    fall back to ``len()`` for the in-memory path).
     """
     mcq_count = sum(1 for q in questions if q.get("type") == MCQ)
     written_count = sum(1 for q in questions if q.get("type") == WRITTEN)
+    shown_valid = total_valid if total_valid is not None else len(questions)
+    shown_skipped = total_skipped if total_skipped is not None else len(skipped)
+    hidden_questions = max(0, shown_valid - len(questions))
     head = [
         "<b>🔍 Preview</b>",
-        f"Valid: <b>{len(questions)}</b> "
+        f"Valid: <b>{shown_valid}</b> "
         f"({mcq_count} multiple-choice, {written_count} written) | "
-        f"Skipped: <b>{len(skipped)}</b>",
+        f"Skipped: <b>{shown_skipped}</b>",
     ]
     if questions:
         head.append("")
         head.append("Samples:")
         for i, q in enumerate(questions[:PREVIEW_MAX_QUESTIONS_SHOWN], 1):
             head.append(html.escape(_preview_line(q, i)))
-        if len(questions) > PREVIEW_MAX_QUESTIONS_SHOWN:
+        if hidden_questions > 0 or len(questions) > PREVIEW_MAX_QUESTIONS_SHOWN:
             head.append(
-                f"… and {len(questions) - PREVIEW_MAX_QUESTIONS_SHOWN} more."
+                f"… and {max(hidden_questions, len(questions) - PREVIEW_MAX_QUESTIONS_SHOWN)} more."
             )
     foot = ["", "Press ✅ Send to dispatch, or ❌ Cancel to discard."]
     kept = list(skipped[:PREVIEW_MAX_SKIPPED_SHOWN])
     while True:
-        hidden = len(skipped) - len(kept)
+        hidden = shown_skipped - len(kept)
         block: List[str] = []
         if skipped:
             block.append("")
@@ -685,8 +715,14 @@ def build_preview_text(
         kept.pop()
 
 
-def build_empty_result_text(skipped: List[Dict[str, str]]) -> str:
-    """HTML notice for zero valid questions; same entity-safe bounding."""
+def build_empty_result_text(skipped: List[Dict[str, str]],
+                             total_skipped: Optional[int] = None) -> str:
+    """HTML notice for zero valid questions; same entity-safe bounding.
+
+    *skipped* may be a bounded sample loaded from disk; pass the real total
+    via *total_skipped* in that case (defaults to ``len()``).
+    """
+    shown_skipped = total_skipped if total_skipped is not None else len(skipped)
     head = ["❌ No valid questions could be extracted."]
     foot = [
         "",
@@ -696,7 +732,7 @@ def build_empty_result_text(skipped: List[Dict[str, str]]) -> str:
     ]
     kept = list(skipped[:PREVIEW_MAX_SKIPPED_SHOWN])
     while True:
-        hidden = len(skipped) - len(kept)
+        hidden = shown_skipped - len(kept)
         block: List[str] = []
         if kept:
             block.append("")
@@ -714,10 +750,45 @@ def build_empty_result_text(skipped: List[Dict[str, str]]) -> str:
         kept.pop()
 
 
+async def _dispatch_single_question(
+    bot: Bot, q: Dict[str, Any], chat_id: int, number: int
+) -> None:
+    """Send one parsed question; raises on validation/delivery failure."""
+    reason = validate_question(q, number=number)
+    if reason is not None:
+        raise ValueError(reason)
+    if q.get("type") == WRITTEN:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=format_written_send_text(q, number),
+            parse_mode="HTML",
+        )
+    else:
+        poll_kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "question": format_mcq_poll_question(q, number),
+            "options": format_mcq_poll_options(q),
+            "type": "quiz",
+            "correct_option_id": q["correct_option_id"],
+            "is_anonymous": True,
+        }
+        # Optional user-supplied clarification -> quiz explanation.
+        # Plain text, sent only when present (never fabricated).
+        clar = str(q.get("clarification") or "").strip()
+        if clar:
+            poll_kwargs["explanation"] = clar
+        await bot.send_poll(**poll_kwargs)
+    await asyncio.sleep(0.5)
+
+
 async def send_telegram_quizzes(
     bot: Bot, questions: List[Dict[str, Any]], chat_id: int, start_number: int
 ) -> Tuple[int, int, List[str], int]:
-    """Dispatch questions: MCQ as anonymous quiz polls, written as spoiler text."""
+    """Dispatch questions: MCQ as anonymous quiz polls, written as spoiler text.
+
+    *questions* may be any iterable (including a lazy generator over a
+    disk store); items are sent one at a time in bounded memory.
+    """
     sent_count = 0
     error_count = 0
     failed_questions: List[str] = []
@@ -725,33 +796,9 @@ async def send_telegram_quizzes(
 
     for q in questions:
         try:
-            reason = validate_question(q, number=current_question_num)
-            if reason is not None:
-                raise ValueError(reason)
-            if q.get("type") == WRITTEN:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=format_written_send_text(q, current_question_num),
-                    parse_mode="HTML",
-                )
-            else:
-                poll_kwargs: Dict[str, Any] = {
-                    "chat_id": chat_id,
-                    "question": format_mcq_poll_question(q, current_question_num),
-                    "options": format_mcq_poll_options(q),
-                    "type": "quiz",
-                    "correct_option_id": q["correct_option_id"],
-                    "is_anonymous": True,
-                }
-                # Optional user-supplied clarification -> quiz explanation.
-                # Plain text, sent only when present (never fabricated).
-                clar = str(q.get("clarification") or "").strip()
-                if clar:
-                    poll_kwargs["explanation"] = clar
-                await bot.send_poll(**poll_kwargs)
+            await _dispatch_single_question(bot, q, chat_id, current_question_num)
             sent_count += 1
             current_question_num += 1
-            await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"Error sending quiz {q.get('question_num', '?')}: {e}")
             error_count += 1
@@ -809,5 +856,324 @@ def save_questions_to_file(questions: List[str], file_path: str) -> bool:
 
 
 def get_temp_file_path(user_id: int, prefix: str = "quiz_", suffix: str = ".txt") -> str:
-    os.makedirs("temp", exist_ok=True)
-    return os.path.join("temp", f"{prefix}{user_id}{suffix}")
+    base = os.environ.get("BOT_TEMP_DIR", "temp")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, f"{prefix}{user_id}{suffix}")
+
+
+# ---------------------------------------------------------------------------
+# Disk-backed streaming parse for uploaded documents
+# ---------------------------------------------------------------------------
+#
+# Uploaded files are never read wholly into RAM (no ``read()`` of the full
+# file) and there is no per-file content-size cap: the file is streamed from
+# disk in fixed-size chunks, split into numbered question blocks, and each
+# block is parsed with the exact same single-block parser as pasted text.
+# Accepted questions are appended to a JSONL store (one JSON object per
+# line) and skipped blocks to a second JSONL store, so preview, dispatch
+# and Show-as-Text all stream from disk in bounded memory. A single block
+# bigger than MAX_UPLOAD_BLOCK_CHARS is skipped with a reason instead of
+# being buffered indefinitely.
+
+#: A line starting a new question block (same boundary as _BLOCK_SPLIT_RE).
+_BLOCK_HEADER_LINE_RE = re.compile(r"^\s*(?:Q\s*)?\d+\s*[.\-)]")
+
+
+def _stream_blocks_from_file(
+    src_path: str, block_limit: int = MAX_UPLOAD_BLOCK_CHARS
+) -> Iterator[Tuple[str, str]]:
+    """Yield ``("block", text)`` / ``("oversized", label)`` from *src_path*.
+
+    Reads the file in fixed-size chunks so peak memory stays bounded no
+    matter how large the file is. Block boundaries are numbered header
+    lines, matching the in-memory ``_BLOCK_SPLIT_RE`` semantics. Oversized
+    blocks are discarded without ever being fully buffered; *label* carries
+    the block's question number when its header was seen, else a Block N
+    fallback.
+    """
+    pending = ""
+    pieces: List[str] = []
+    pieces_len = 0
+    oversized = False
+    oversized_label = ""
+    block_index = 0
+    finished = False
+
+    def _header_number(line: str) -> Optional[str]:
+        m = re.match(r"^\s*(?:Q\s*)?(\d+)\s*[.\-)]", line)
+        return m.group(1) if m else None
+
+    def _flush() -> Optional[Tuple[str, str]]:
+        nonlocal pieces, pieces_len, oversized, oversized_label, block_index
+        if oversized:
+            label = oversized_label or f"Block {block_index + 1}"
+            block_index += 1
+            oversized = False
+            oversized_label = ""
+            pieces = []
+            pieces_len = 0
+            return ("oversized", label)
+        text = "".join(pieces).strip()
+        pieces = []
+        pieces_len = 0
+        if not text:
+            return None
+        block_index += 1
+        return ("block", text)
+
+    with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+        while True:
+            chunk = f.read(UPLOAD_READ_CHUNK_CHARS)
+            if chunk == "":
+                finished = True
+            pending += chunk.replace("\r\n", "\n").replace("\r", "\n")
+            lines = pending.split("\n")
+            # Last element is incomplete (no trailing newline yet) unless EOF.
+            pending = "" if finished else lines.pop()
+            if not finished and len(pending) > block_limit + UPLOAD_READ_CHUNK_CHARS:
+                # A single line longer than the block budget: the current
+                # block can never fit, and keeping the tail would grow memory
+                # without bound. Doom the block (discarded until the next
+                # header) and keep only a bounded tail slice.
+                oversized = True
+                pieces = []
+                pieces_len = 0
+                pending = pending[-4096:]
+            out: List[Tuple[str, str]] = []
+            for line in lines:
+                if _BLOCK_HEADER_LINE_RE.match(line):
+                    flushed = _flush()
+                    if flushed is not None:
+                        out.append(flushed)
+                    num = _header_number(line)
+                    if num is not None:
+                        oversized_label = num
+                if oversized:
+                    continue
+                pieces.append(line + "\n")
+                pieces_len += len(line) + 1
+                if pieces_len > block_limit:
+                    # Block too big: drop what we buffered and discard
+                    # lines until the next header (or EOF).
+                    oversized = True
+                    pieces = []
+                    pieces_len = 0
+            for item in out:
+                yield item
+            if finished:
+                flushed = _flush()
+                if flushed is not None:
+                    yield flushed
+                return
+
+
+class _DiskSeenTexts:
+    """SQLite-backed duplicate tracker for streaming upload parses.
+
+    Implements the ``__contains__``/``add`` protocol used by
+    :func:`_parse_single_block`, so duplicate semantics match the
+    in-memory parser exactly -- but holds no question text in RAM.
+    Membership is a UNIQUE-index lookup on the SHA-256 of the question
+    text in a job-local SQLite file, so peak memory stays flat no matter
+    how many questions the upload contains. Call :meth:`dispose` when
+    the parse finishes; it closes the database and removes the file
+    (long-term results are the JSONL stores, not this index).
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+        self._conn = sqlite3.connect(db_path)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS seen (h TEXT PRIMARY KEY)")
+        self._conn.commit()
+
+    @staticmethod
+    def _digest(item: str) -> str:
+        return hashlib.sha256(item.encode("utf-8")).hexdigest()
+
+    def __contains__(self, item: object) -> bool:
+        if not isinstance(item, str):
+            return False
+        cur = self._conn.execute(
+            "SELECT 1 FROM seen WHERE h = ?", (self._digest(item),))
+        return cur.fetchone() is not None
+
+    def add(self, item: str) -> None:
+        # No per-item commit: the single connection sees its own writes,
+        # and dispose() commits once at the end of the parse.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO seen (h) VALUES (?)",
+            (self._digest(item),))
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def dispose(self) -> None:
+        try:
+            try:
+                self._conn.commit()
+            finally:
+                self._conn.close()
+        except Exception:
+            logger.warning("Could not close dedup database.", exc_info=True)
+        finally:
+            try:
+                os.remove(self._db_path)
+            except OSError:
+                pass
+
+
+def parse_upload_file_to_disk(
+    src_path: str, job_dir: str,
+    block_limit: int = MAX_UPLOAD_BLOCK_CHARS,
+) -> Dict[str, Any]:
+    """Stream-parse an uploaded file into JSONL stores under *job_dir*.
+
+    Synchronous (run it in an executor from async code). Returns a summary
+    dict ``{"valid_count", "skipped_count", "questions_file",
+    "skipped_file"}``. Never holds more than one question block plus a
+    fixed-size read chunk in RAM -- including duplicate tracking, which
+    uses a job-local SQLite UNIQUE index on question-text hashes instead
+    of an in-memory set, so peak memory stays flat no matter how many
+    questions the upload contains. The dedup database is removed before
+    returning (success or failure); long-term results are the two JSONL
+    stores, cleaned up with the job directory.
+    """
+    os.makedirs(job_dir, exist_ok=True)
+    questions_file = os.path.join(job_dir, "questions.jsonl")
+    skipped_file = os.path.join(job_dir, "skipped.jsonl")
+    valid_count = 0
+    skipped_count = 0
+    seen_texts = _DiskSeenTexts(os.path.join(job_dir, "dedup.db"))
+    try:
+        with open(questions_file, "w", encoding="utf-8") as qf, open(
+            skipped_file, "w", encoding="utf-8"
+        ) as sf:
+            for kind, payload in _stream_blocks_from_file(src_path, block_limit):
+                if kind == "oversized":
+                    skipped_count += 1
+                    sf.write(json.dumps(
+                        {"number": payload,
+                         "reason": (
+                             "Question block exceeds the safe per-question memory "
+                             f"limit ({block_limit} chars); skipped instead of "
+                             "buffering it."),
+                         }, ensure_ascii=False) + "\n")
+                    continue
+                try:
+                    question, skip = _parse_single_block(
+                        payload, f"Block {valid_count + skipped_count + 1}", seen_texts)
+                except Exception as e:
+                    logger.error(
+                        f"Error processing streamed block: {e}\n"
+                        f"Content: {payload[:200]}...", exc_info=True)
+                    question, skip = None, {
+                        "number": f"Block {valid_count + skipped_count + 1}",
+                        "reason": f"An unexpected error occurred: {e}",
+                    }
+                if question is not None:
+                    # Prefix-aware position check up front: the sequential
+                    # dispatch number of this question is already known
+                    # (1-based count of accepted questions so far + 1), so an
+                    # MCQ that only overflows under its real prefix is skipped
+                    # here instead of a later whole-list pass. This matches the
+                    # in-memory fixpoint outcome: removals only shrink later
+                    # numbers, so a single forward pass is exact.
+                    pos = valid_count + 1
+                    reason = None
+                    if question.get("type") == MCQ:
+                        reason = validate_question(question, number=pos)
+                    if reason is not None:
+                        skipped_count += 1
+                        sf.write(json.dumps(
+                            {"number": str(question.get("question_num", pos)),
+                             "reason": reason}, ensure_ascii=False) + "\n")
+                        continue
+                    valid_count += 1
+                    qf.write(json.dumps(question, ensure_ascii=False) + "\n")
+                elif skip is not None:
+                    skipped_count += 1
+                    sf.write(json.dumps(skip, ensure_ascii=False) + "\n")
+    finally:
+        seen_texts.dispose()
+    logger.info(
+        f"Stream-parsed upload {src_path}: {valid_count} valid, "
+        f"{skipped_count} skipped.")
+    return {
+        "valid_count": valid_count,
+        "skipped_count": skipped_count,
+        "questions_file": questions_file,
+        "skipped_file": skipped_file,
+    }
+
+
+def iter_disk_questions(questions_file: str) -> Iterator[Dict[str, Any]]:
+    """Lazily yield parsed questions from a JSONL store (bounded memory)."""
+    with open(questions_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def iter_disk_skipped(skipped_file: str,
+                      limit: Optional[int] = None) -> Iterator[Dict[str, str]]:
+    """Lazily yield skipped entries from a JSONL store (bounded memory)."""
+    count = 0
+    with open(skipped_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if limit is not None and count >= limit:
+                return
+            count += 1
+            yield json.loads(line)
+
+
+def load_preview_sample(
+    questions_file: str, skipped_file: str,
+    max_questions: int = PREVIEW_MAX_QUESTIONS_SHOWN,
+    max_skipped: int = PREVIEW_MAX_SKIPPED_SHOWN,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Load bounded preview samples from JSONL stores (never the full set)."""
+    return (list(iter_disk_questions_bounded(questions_file, max_questions)),
+            list(iter_disk_skipped(skipped_file, max_skipped)))
+
+
+def iter_disk_questions_bounded(
+    questions_file: str, limit: int
+) -> Iterator[Dict[str, Any]]:
+    """Yield at most *limit* questions from a JSONL store."""
+    count = 0
+    for q in iter_disk_questions(questions_file):
+        if count >= limit:
+            return
+        count += 1
+        yield q
+
+
+def stream_questions_to_export_file(
+    questions_file: str, export_path: str
+) -> int:
+    """Serialize a JSONL question store to the strict text format on disk.
+
+    Streams in bounded memory; returns the number of questions written.
+    """
+    count = 0
+    with open(export_path, "w", encoding="utf-8") as out:
+        first = True
+        for q in iter_disk_questions(questions_file):
+            count += 1
+            if not first:
+                out.write("\n\n")
+            first = False
+            out.write(format_question_export(q, count))
+    return count
+
+
+def stream_questions_to_text_list(
+    questions: Iterable[Dict[str, Any]],
+) -> List[str]:
+    """Serialize an in-memory question iterable to export strings."""
+    return [format_question_export(q, i) for i, q in enumerate(questions, 1)]

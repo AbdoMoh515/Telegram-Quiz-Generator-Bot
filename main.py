@@ -7,9 +7,13 @@ from aiogram.filters import Command, CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand, ErrorEvent
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 
 from config import TELEGRAM_TOKEN, LOG_CHANNEL_ID
 from filedb import load_allowed_users_cache
+from states import UserState
+import upload_queue
 from handlers import (
     start_command,
     help_command,
@@ -32,7 +36,9 @@ from handlers_admin import (
     AccessControlMiddleware,
     handle_allow_user_callback,
     handle_remove_user_callback,
-    handle_admin_cancel_callback
+    handle_admin_cancel_callback,
+    handle_approve_callback,
+    handle_reject_callback,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +77,8 @@ async def main():
     dp.callback_query.register(handle_allow_user_callback, F.data.startswith("allow:"))
     dp.callback_query.register(handle_remove_user_callback, F.data.startswith("remove:"))
     dp.callback_query.register(handle_admin_cancel_callback, F.data == "admin_cancel")
+    dp.callback_query.register(handle_approve_callback, F.data.startswith("approve:"))
+    dp.callback_query.register(handle_reject_callback, F.data.startswith("reject:"))
 
     @dp.error()
     async def error_handler(event: ErrorEvent):
@@ -92,12 +100,40 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     load_allowed_users_cache()
     await set_commands(bot)
+
+    # Global upload queue: two FIFO worker slots for ALL document uploads.
+    # Workers need per-user FSM access for the preview step, hence the
+    # factory; question records themselves stay on disk, never in FSM.
+    def _fsm_factory(chat_id: int, user_id: int) -> FSMContext:
+        return FSMContext(
+            storage=dp.storage,
+            key=StorageKey(chat_id=chat_id, user_id=user_id, bot_id=bot.id),
+        )
+
+    upload_workers = upload_queue.start_workers(
+        bot, fsm_factory=_fsm_factory,
+        awaiting_state=UserState.AWAITING_CONFIRMATION)
+    try:
+        requeues, cleaned = await asyncio.to_thread(upload_queue.recover_spool)
+        revived = await asyncio.to_thread(upload_queue.reregister_previews)
+        for manifest in requeues:
+            upload_queue.requeue_job(manifest["job_id"])
+        logger.info(
+            f"Upload recovery: {len(requeues)} queued job(s) resumed, "
+            f"{revived} live preview(s) re-registered, {cleaned} stale "
+            f"spool entr(y/ies) cleaned.")
+    except Exception as e:
+        logger.error(f"Upload spool recovery failed: {e}", exc_info=True)
     
     logger.info("Bot is starting...")
     if LOG_CHANNEL_ID:
         await bot.send_message(LOG_CHANNEL_ID, "🚀 Bot has started successfully!")
         
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in upload_workers:
+            task.cancel()
 
 if __name__ == "__main__":
     try:

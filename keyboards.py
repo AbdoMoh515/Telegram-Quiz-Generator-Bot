@@ -60,3 +60,11 @@ def get_collect_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Cancel", callback_data="collect_cancel")],
     ])
 
+
+def get_access_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Approve/Reject controls DM'd to admins for an access request."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{user_id}")],
+        [InlineKeyboardButton(text="❌ Reject", callback_data=f"reject:{user_id}")],
+    ])
+

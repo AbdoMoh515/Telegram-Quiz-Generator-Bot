@@ -1,7 +1,6 @@
 import logging
 import os
 import secrets
-import tempfile
 import asyncio
 from datetime import datetime
 from aiogram import types, Bot
@@ -10,9 +9,10 @@ from aiogram.exceptions import TelegramBadRequest
 
 from config import ADMIN_IDS
 from utils import (
-    extract_text_from_file,
     extract_questions_from_text,
     send_telegram_quizzes,
+    iter_disk_questions,
+    stream_questions_to_export_file,
     format_quiz_as_text,
     format_question_export,
     build_preview_text,
@@ -24,15 +24,24 @@ from utils import (
     MAX_COLLECT_MESSAGES,
     MAX_COLLECT_CHARS,
 )
-from filedb import upsert_user
+from filedb import upsert_user, is_user_allowed
 from keyboards import (
     get_main_keyboard,
     get_admin_keyboard,
     get_preview_keyboard,
     get_collect_keyboard,
+    get_access_request_keyboard,
 )
 from handlers_admin import handle_admin_text_message
 from states import UserState
+import upload_queue
+from access_requests import (
+    arequest_access,
+    arecord_admin_message,
+    areopen_approved_request,
+    build_access_request_text,
+    format_full_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +142,79 @@ def get_file_processing_keyboard():
 async def start_command(message: types.Message, state: FSMContext):
     await state.clear()
     user = message.from_user
-    upsert_user(user.id, user.username, user.first_name)
-    await message.answer(
-        "👋 Welcome to the Quiz Bot!", reply_markup=get_main_keyboard(user.id)
+    username = getattr(user, "username", "") or ""
+    first_name = getattr(user, "first_name", "") or ""
+    last_name = getattr(user, "last_name", "") or ""
+    # Capture the newest username/full name; existing rows keep their other
+    # fields (date_joined, extras) for backward compatibility.
+    upsert_user(user.id, username, first_name, last_name)
+    if user.id in ADMIN_IDS or is_user_allowed(user.id):
+        # Admins and already-approved users never trigger approval requests.
+        await message.answer(
+            "👋 Welcome to the Quiz Bot!", reply_markup=get_main_keyboard(user.id)
+        )
+        return
+    full_name = format_full_name(first_name, last_name)
+    disposition = await arequest_access(user.id, username, full_name)
+    if disposition == "approved":
+        # Never welcome on the request record alone: the allowed list is
+        # the source of truth (a manual remove after approval leaves an
+        # "approved" row behind). Re-arm such rows to pending so this
+        # /start notifies admins again like a fresh request.
+        if user.id in ADMIN_IDS or is_user_allowed(user.id):
+            await message.answer(
+                "👋 Welcome to the Quiz Bot!", reply_markup=get_main_keyboard(user.id)
+            )
+            return
+        try:
+            rearmed = await areopen_approved_request(
+                user.id, username, full_name)
+        except Exception as e:
+            logger.warning(f"Could not re-open stale approved request for "
+                           f"{user.id}: {e}")
+            rearmed = False
+        if rearmed:
+            disposition = "created"
+        else:
+            # Lost a race (the row changed under us): fall back to a
+            # pending notice rather than welcoming an unauthorized user.
+            await message.reply(
+                "⏳ Your access request is still pending. "
+                "An administrator will review it soon."
+            )
+            return
+    if disposition == "rejected":
+        await message.reply(
+            "❌ Your access request was declined. "
+            "Contact an administrator if you believe this is a mistake."
+        )
+        return
+    if disposition == "pending":
+        # Repeat /start while a request is live: remind, never re-notify
+        # admins (anti-spam).
+        await message.reply(
+            "⏳ Your access request is still pending. "
+            "An administrator will review it soon."
+        )
+        return
+    # Newly created request: DM every admin an inline Approve/Reject card.
+    text = build_access_request_text(username, full_name, user.id)
+    bot = getattr(message, "bot", None)
+    if bot is not None and ADMIN_IDS:
+        for admin_id in ADMIN_IDS:
+            try:
+                sent = await bot.send_message(
+                    admin_id, text,
+                    reply_markup=get_access_request_keyboard(user.id),
+                )
+                await arecord_admin_message(
+                    user.id, admin_id, getattr(sent, "message_id", 0))
+            except Exception as e:
+                logger.warning(f"Could not notify admin {admin_id} of "
+                               f"access request from {user.id}: {e}")
+    await message.reply(
+        "⏳ Your access request has been sent to the administrators. "
+        "You will be notified once it is reviewed."
     )
 
 async def help_command(message: types.Message):
@@ -273,6 +352,34 @@ async def process_quiz_extraction(message: types.Message, state: FSMContext, tex
     )
 
 
+async def _check_upload_token_owner(callback_query: types.CallbackQuery,
+                                    token: str):
+    """Refuse foreign taps on a disk-backed upload preview.
+
+    Returns "ok" when the tapping user/chat owns the preview, "forbidden"
+    (after answering) when they do not, and None when the token is not a
+    live upload preview (stale/legacy -- the caller falls through to the
+    existing dead-token/legacy handling). Runs BEFORE any consume, so
+    unauthorized presses can neither dispatch nor cancel anything.
+    """
+    info = await upload_queue.describe_upload_token(token)
+    if info is None:
+        return None
+    actor_id = getattr(callback_query.from_user, "id", None)
+    if actor_id is not None and info.get("user_id") != actor_id:
+        await callback_query.answer(
+            "This preview belongs to another user.", show_alert=True)
+        return "forbidden"
+    message = getattr(callback_query, "message", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is not None and info.get("chat_id") != chat_id:
+        await callback_query.answer(
+            "This preview belongs to another chat.", show_alert=True)
+        return "forbidden"
+    return "ok"
+
+
 async def _check_preview_token(callback_query: types.CallbackQuery, state: FSMContext):
     """Validate the preview callback against the stored token.
 
@@ -301,6 +408,38 @@ async def _check_preview_token(callback_query: types.CallbackQuery, state: FSMCo
 
 
 async def confirm_send_callback(callback_query: types.CallbackQuery, state: FSMContext, bot: Bot):
+    parts = (callback_query.data or "").split(":", 1)
+    if len(parts) == 2:
+        # Disk-backed upload preview (token registry, not FSM lists).
+        # Ownership is verified before the claim so a foreign tap can
+        # neither dispatch nor consume the token. Only the quick
+        # check-and-claim runs under the lock; dispatch (0.5s per
+        # question) happens outside it so one large upload never blocks
+        # other users' Send/Cancel.
+        ownership = await _check_upload_token_owner(
+            callback_query, parts[1])
+        if ownership == "forbidden":
+            return
+        job = None
+        dead = None
+        async with _preview_claim_lock:
+            job = await upload_queue.consume_upload_token(parts[1])
+            if job is None:
+                dead = upload_queue.dead_token_reason(parts[1])
+        if job is not None:
+            await _confirm_upload_send(callback_query, state, bot, job)
+            return
+        if dead == upload_queue.DEAD_CONSUMED:
+            await callback_query.answer("Already processed.",
+                                        show_alert=True)
+            return
+        if dead == upload_queue.DEAD_EXPIRED:
+            await callback_query.answer(
+                "That result has expired. "
+                "Please upload the file again.", show_alert=True)
+            return
+        # Unknown token: a legacy in-memory preview (handled below) or
+        # truly stale (the legacy check answers accordingly).
     async with _preview_claim_lock:
         data = await _check_preview_token(callback_query, state)
         if data is None:
@@ -350,6 +489,37 @@ async def confirm_send_callback(callback_query: types.CallbackQuery, state: FSMC
 
 
 async def cancel_send_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    parts = (callback_query.data or "").split(":", 1)
+    if len(parts) == 2:
+        # Disk-backed upload preview (token registry, not FSM lists).
+        # Ownership is verified before the claim so a foreign tap can
+        # neither cancel nor consume the token. Only the quick claim
+        # runs under the lock; disk/network cleanup happens outside it
+        # so a slow cancel never blocks other users.
+        ownership = await _check_upload_token_owner(
+            callback_query, parts[1])
+        if ownership == "forbidden":
+            return
+        job = None
+        dead = None
+        async with _preview_claim_lock:
+            job = await upload_queue.consume_upload_token(parts[1])
+            if job is None:
+                dead = upload_queue.dead_token_reason(parts[1])
+        if job is not None:
+            await _cancel_upload_send(callback_query, state, job)
+            return
+        if dead == upload_queue.DEAD_CONSUMED:
+            await callback_query.answer("Already processed.",
+                                        show_alert=True)
+            return
+        if dead == upload_queue.DEAD_EXPIRED:
+            await callback_query.answer(
+                "That result has expired. "
+                "Please upload the file again.", show_alert=True)
+            return
+        # Unknown token: a legacy in-memory preview (handled below) or
+        # truly stale (the legacy check answers accordingly).
     async with _preview_claim_lock:
         data = await _check_preview_token(callback_query, state)
         if data is None:
@@ -434,30 +604,102 @@ async def handle_file(message: types.Message, state: FSMContext):
             "Please convert your file to plain text and try again."
         )
         return
-    processing_msg = await message.reply("🔄 Processing file...")
-    temp_path = None
+    file_id = getattr(message.document, "file_id", None)
+    if not file_id:
+        await message.reply(
+            "❌ Could not read that file reference. Please re-upload the file."
+        )
+        return
+    # Never download here: every upload waits its turn in the single global
+    # FIFO (at most two process at once). Only small metadata is queued, so
+    # extra uploads stay fair instead of downloading concurrently. FSM
+    # holds no per-upload list: each preview is tracked by its own small
+    # job id / token pair written when the preview is delivered.
+    job_id, position = await upload_queue.enqueue_upload(
+        message.from_user.id, message.chat.id, file_id, file_name)
+    if position <= 1:
+        await message.reply(
+            "🔄 Processing file... I'll send a preview here when it's ready."
+        )
+    else:
+        await message.reply(
+            f"📥 Queued at position #{position}. At most two files process "
+            "at once; I'll send your preview here when it's your turn."
+        )
+
+
+def _clear_upload_preview_kwargs():
+    return {
+        'preview_job_id': None,
+        'preview_valid_count': None,
+        'preview_skipped_count': None,
+    }
+
+
+async def _confirm_upload_send(callback_query: types.CallbackQuery,
+                               state: FSMContext, bot: Bot,
+                               job: dict):
+    """Dispatch a disk-backed upload preview claimed from the queue."""
+    job_id = job["_job_id"]
+    await callback_query.answer("Sending...")
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=os.path.splitext(file_name)[1].lower()
-        ) as temp_file:
-            temp_path = temp_file.name
-        await message.bot.download(message.document, destination=temp_path)
-        text = await extract_text_from_file(temp_path)
-        if not (text or "").strip():
-            await message.reply("❌ Could not read any text from that file.")
-            await state.set_state(UserState.IDLE)
-            return
-        await process_quiz_extraction(message, state, text)
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        sent, failed, _, _ = await send_telegram_quizzes(
+            bot, iter_disk_questions(upload_queue.questions_path(job_id)),
+            callback_query.message.chat.id, 1,
+        )
+    except Exception as e:
+        logger.error(f"Upload dispatch failed for job {job_id}: {e}",
+                     exc_info=True)
+        await upload_queue.mark_upload_cancelled(job_id)
+        await state.update_data(**_clear_preview_data_kwargs(),
+                                **_clear_upload_preview_kwargs())
+        await state.set_state(UserState.IDLE)
         try:
-            await processing_msg.delete()
-        except Exception:
+            await callback_query.message.edit_text(
+                "❌ Dispatch failed. Nothing was sent.")
+        except TelegramBadRequest:
             pass
+        return
+    skipped_count = int(job.get("skipped_count") or 0)
+    result_msg = f"✅ Success! Sent {sent} question(s)."
+    if skipped_count:
+        result_msg += f"\n⚠️ Skipped {skipped_count} item(s)."
+    if failed > 0:
+        result_msg += f"\n❌ Failed to send {failed} question(s)."
+    try:
+        await callback_query.message.edit_text("📤 Dispatched. See summary below.")
+    except TelegramBadRequest:
+        pass
+    await upload_queue.mark_upload_dispatched(job_id)
+    # Keep extracted_job_id for the "Show as Text" export, but the preview
+    # token is consumed so this message cannot re-send.
+    await state.update_data(**_clear_preview_data_kwargs(),
+                            **_clear_upload_preview_kwargs(),
+                            extracted_job_id=job_id)
+    await state.set_state(UserState.IDLE)
+    await callback_query.message.answer(
+        result_msg, reply_markup=get_file_processing_keyboard()
+    )
+
+
+async def _cancel_upload_send(callback_query: types.CallbackQuery,
+                              state: FSMContext, job: dict):
+    """Discard a disk-backed upload preview claimed from the queue."""
+    job_id = job["_job_id"]
+    await upload_queue.mark_upload_cancelled(job_id)
+    await state.update_data(**_clear_preview_data_kwargs(),
+                            **_clear_upload_preview_kwargs(),
+                            extracted_job_id=None)
+    await state.set_state(UserState.IDLE)
+    await callback_query.answer("Cancelled.", show_alert=True)
+    try:
+        await callback_query.message.edit_text("❌ Send cancelled. Nothing was sent.")
+    except TelegramBadRequest:
+        pass
+    await callback_query.message.answer(
+        "Returning to the main menu.",
+        reply_markup=get_main_keyboard(callback_query.from_user.id),
+    )
 
 async def handle_text_message(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -526,6 +768,34 @@ async def cancel_extraction_callback(callback_query: types.CallbackQuery, state:
 
 async def show_questions_callback(callback_query: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    job_id = data.get('extracted_job_id')
+    if job_id:
+        # Disk-backed upload result: stream the export in bounded memory.
+        if not upload_queue.job_files_exist(job_id):
+            await callback_query.answer(
+                "That result has expired (cleaned up). "
+                "Please upload the file again.", show_alert=True)
+            await state.update_data(extracted_job_id=None)
+            return
+        await callback_query.answer("Generating text file...")
+        export_name = f"upload_export_{job_id}.txt"
+        export_dir = os.environ.get("BOT_TEMP_DIR", "temp")
+        os.makedirs(export_dir, exist_ok=True)
+        export_path = os.path.join(export_dir, export_name)
+        try:
+            count = await asyncio.to_thread(
+                stream_questions_to_export_file,
+                upload_queue.questions_path(job_id), export_path)
+            await callback_query.message.answer_document(
+                types.FSInputFile(export_path, filename="extracted_questions.txt"),
+                caption=f"📋 Here are the {count} extracted questions."
+            )
+        finally:
+            try:
+                os.remove(export_path)
+            except OSError:
+                pass
+        return
     questions = data.get('extracted_questions')
     if not questions:
         await callback_query.answer("No data found.", show_alert=True)
@@ -541,6 +811,11 @@ async def show_questions_callback(callback_query: types.CallbackQuery, state: FS
     os.remove(file_path)
 
 async def cancel_processing_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    job_id = data.get('extracted_job_id')
+    if job_id:
+        # Drop the disk-backed upload result too (best effort).
+        await upload_queue.mark_upload_cancelled(job_id)
     await state.clear()
     await callback_query.answer("Cancelled.", show_alert=True)
     await callback_query.message.edit_text("❌ Process cancelled.")
