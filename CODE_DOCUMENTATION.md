@@ -34,7 +34,6 @@ The project is organized into the following key files:
 
 - **`allow_user_command()`**: An admin command to grant a user access to the bot.
 - **`removeuser_command()`**: An admin command to revoke a user's access.
-- **`listusers_command()`**: An admin command to list all users who have interacted with the bot.
 - **`AccessControlMiddleware`**: A middleware that checks if a user is authorized to use the bot before processing their message.
 
 ### `utils.py`

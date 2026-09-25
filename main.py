@@ -30,9 +30,7 @@ from handlers import (
     handle_text_message
 )
 from handlers_admin import (
-    listusers_command,
     myaccess_command,
-    userlist_command,
     AccessControlMiddleware,
     handle_allow_user_callback,
     handle_remove_user_callback,
@@ -58,9 +56,6 @@ async def main():
     dp.message.register(help_command, Command("help"))
     dp.message.register(myaccess_command, Command("myaccess"))
     
-    dp.message.register(listusers_command, Command("listusers"))
-    dp.message.register(userlist_command, Command("userlist"))
-
     dp.message.register(handle_file, F.document)
     dp.message.register(handle_quiz_message, F.poll.type == 'quiz')
     dp.message.register(handle_text_message, F.text & ~F.text.startswith('/'))

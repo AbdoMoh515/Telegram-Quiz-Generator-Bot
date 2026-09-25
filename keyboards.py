@@ -25,7 +25,6 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✅ Allow User"), KeyboardButton(text="❌ Remove User")],
-            [KeyboardButton(text="📋 List Allowed Users"), KeyboardButton(text="👥 List All Users")],
             [KeyboardButton(text="⬅️ Back to Main Menu")]
         ],
         resize_keyboard=True,

@@ -6,7 +6,8 @@ booting/
 
 # Ignore env variables
 .env
-
+allowed_users.json
+users.json
 # Ignore other common Python files
 __pycache__/
 *.pyc

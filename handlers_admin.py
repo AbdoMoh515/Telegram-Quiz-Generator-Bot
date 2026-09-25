@@ -67,26 +67,6 @@ class AccessControlMiddleware(BaseMiddleware):
         logger.warning(f"Denied access for unauthorized user {user.id} (@{user.username})")
         return
 
-async def listusers_command(message: Message):
-    users = list_allowed_users()
-    if not users:
-        await message.reply("No users are currently on the allowed list.")
-        return
-    msg_parts = ["<b>📋 Allowed Users:</b>"]
-    for u in users:
-        msg_parts.append(f"  • <code>{u['id']}</code> - {u.get('first_name', 'N/A')} (@{u.get('username', 'N/A')})")
-    await message.reply("\n".join(msg_parts))
-
-async def userlist_command(message: Message):
-    users = list_all_users()
-    if not users:
-        await message.reply("No users have started the bot yet.")
-        return
-    msg_parts = ["<b>👥 All Users in Database:</b>"]
-    for u in users:
-        msg_parts.append(f"  • <code>{u['id']}</code> - {u.get('first_name', 'N/A')} (@{u.get('username', 'N/A')})")
-    await message.reply("\n".join(msg_parts))
-
 async def myaccess_command(message: Message):
     user_id = message.from_user.id
     if user_id in ADMIN_IDS:
@@ -124,10 +104,6 @@ async def handle_admin_text_message(message: Message, state: FSMContext):
         keyboard = create_user_selection_keyboard(allowed_users, "remove")
         await message.answer("Select a user to remove:", reply_markup=keyboard)
 
-    elif text == "📋 List Allowed Users":
-        await listusers_command(message)
-    elif text == "👥 List All Users":
-        await userlist_command(message)
     elif text == "⬅️ Back to Main Menu":
         await state.set_state(UserState.IDLE)
         await message.answer("⬅️ Returning to the main menu.", reply_markup=get_main_keyboard(message.from_user.id))
